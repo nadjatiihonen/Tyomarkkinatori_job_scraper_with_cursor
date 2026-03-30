@@ -67,6 +67,52 @@ def _normalize_url(href: str) -> str:
     return (href or "").split("?")[0].rstrip("/")
 
 
+def _extract_yritys_from_listing_card(loc, title_hint: str = "") -> str:
+    """
+    Company on listing card: 'Yritys | Julkaistu …' (walk up from job link).
+    / Listauskortilla yritys näkyy rivillä ennen putkea ja Julkaistu-tekstiä.
+    """
+    hint = (title_hint or "").strip()
+    try:
+        raw = loc.evaluate(
+            """(el, titleHint) => {
+                const hint = (titleHint || '').toString().trim();
+                const tryLine = (line) => {
+                    const s = (line || '').trim();
+                    const bar = s.indexOf('|');
+                    if (bar < 0) return '';
+                    if (!/Julkaistu/i.test(s.slice(bar + 1))) return '';
+                    let left = s.slice(0, bar).trim();
+                    if (!left || left.length > 200) return '';
+                    if (hint && left.startsWith(hint)) {
+                        left = left.slice(hint.length).trim();
+                        left = left.replace(/^[,|\\s\\u00a0–-]+/, '').trim();
+                    }
+                    return left;
+                };
+                let n = el;
+                for (let d = 0; d < 14 && n; d++) {
+                    const rawText = n.innerText || '';
+                    const lines = rawText.split(/\\r?\\n/).map(t => t.trim()).filter(Boolean);
+                    for (const line of lines) {
+                        const got = tryLine(line);
+                        if (got) return got;
+                    }
+                    const oneLine = rawText.replace(/\\s+/g, ' ').trim();
+                    const got = tryLine(oneLine);
+                    if (got) return got;
+                    n = n.parentElement;
+                }
+                return '';
+            }""",
+            hint,
+        )
+    except Exception:
+        return ""
+    s = (raw or "").strip()
+    return s[:500] if s else ""
+
+
 def _is_job_link(href: str) -> bool:
     """Job-card link, not listing page link. / Työpaikkailmoituksen korttilinkki, ei listaussivun linkki."""
     if not href or RE_LISTING.match(href):
@@ -85,7 +131,7 @@ def _is_job_link(href: str) -> bool:
 
 
 def fetch_listing_page(page, page_num: int, aggressive: bool = False) -> list[dict]:
-    """Cards from one listing page. / Yhden listaussivun kortit: [{"Linkki", "Tehtävänimike"}, ...]."""
+    """Cards from one listing page. / Yhden listaussivun kortit: Linkki, Tehtävänimike, Yritys (listausrivi)."""
     url = BASE_URL.format(p=page_num)
     for attempt in range(2):
         try:
@@ -132,7 +178,12 @@ def fetch_listing_page(page, page_num: int, aggressive: bool = False) -> list[di
             title = (loc.inner_text() or "").strip()
             if not title or len(title) > 500:
                 title = loc.get_attribute("title") or ""
-            results.append({"Linkki": url_norm, "Tehtävänimike": title or "-"})
+            title = title or "-"
+            yritys = _extract_yritys_from_listing_card(loc, title_hint=title)
+            yritys = _clean_company_name(yritys)
+            if _looks_like_location(yritys):
+                yritys = ""
+            results.append({"Linkki": url_norm, "Tehtävänimike": title, "Yritys": yritys})
         except Exception:
             continue
 
@@ -642,6 +693,23 @@ Guarantee: len(df) == len(jobs_from_web). / Takuu: len(df) == len(jobs_from_web)
             t = link_to_title.get(_norm_link(str(df.at[i, "Linkki"])), "-")
             if t and str(t).strip().lower() != "nan":
                 df.at[i, "Tehtävänimike"] = str(t)
+
+    link_to_yritys: dict[str, str] = {}
+    for j in jobs_from_web:
+        lk = _norm_link(j["Linkki"])
+        if not lk:
+            continue
+        raw_y = str(j.get("Yritys", "") or "").strip()
+        if not raw_y:
+            continue
+        y = _clean_company_name(raw_y)
+        if y and not _looks_like_location(y):
+            link_to_yritys[lk] = y
+    for i in df.index:
+        y = link_to_yritys.get(_norm_link(str(df.at[i, "Linkki"])), "")
+        if y:
+            df.at[i, "Yritys"] = y
+
     order = {_norm_link(j["Linkki"]): i for i, j in enumerate(jobs_from_web)}
     df["_ord"] = df["Linkki"].astype(str).apply(lambda x: order.get(_norm_link(x), 999))
     df = df.sort_values("_ord").drop(columns=["_ord"])
