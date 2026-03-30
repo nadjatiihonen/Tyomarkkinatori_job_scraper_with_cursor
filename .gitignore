@@ -1,0 +1,6 @@
+.venv/
+.DS_Store
+*.xlsx
+__pycache__/
+*.pyc
+Идеи*
