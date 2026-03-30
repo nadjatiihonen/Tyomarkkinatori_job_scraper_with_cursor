@@ -347,6 +347,33 @@ def _parse_card_text(text: str) -> dict:
     return out
 
 
+def _clean_company_name(value: str) -> str:
+    """Return a plausible company name or empty string. / Palauta kelvollinen yritysnimi tai tyhjä merkkijono."""
+    s = (value or "").strip()
+    if not s:
+        return ""
+    # Filter out long description-like sentences.
+    if len(s) > 80:
+        return ""
+    low = s.lower()
+    bad_tokens = (" toimii ", " yrityksessä", " tehtävässä", " rooli ", " tiimi ")
+    if any(t in low for t in bad_tokens):
+        return ""
+    return s
+
+
+def _company_from_title(title: str) -> str:
+    """Try deriving company name from listing title. / Yritä päätellä yritys työpaikan otsikosta."""
+    t = (title or "").strip()
+    if not t:
+        return ""
+    parts = [p.strip() for p in t.split(",") if p.strip()]
+    if len(parts) < 2:
+        return ""
+    cand = parts[-1]
+    return _clean_company_name(cand)
+
+
 # ---------------------------------------------------------------------------
 # Card loading / Ilmoituskortin lataus
 # ---------------------------------------------------------------------------
@@ -383,7 +410,7 @@ def _extract_ammattiryhma(page) -> str:
         return ""
 
 
-def fetch_card_details(page, url: str) -> dict:
+def fetch_card_details(page, url: str, title_hint: str = "") -> dict:
     """Open card and parse all fields. / Avaa kortti ja jäsennä kaikki kentät."""
     out = {k: "" for k in CARD_COLUMNS}
     s = (url or "").strip()
@@ -411,6 +438,10 @@ def fetch_card_details(page, url: str) -> dict:
 
     if not out.get("Ammattiryhmä"):
         out["Ammattiryhmä"] = _extract_ammattiryhma(page)
+    # Keep only plausible company names.
+    out["Yritys"] = _clean_company_name(out.get("Yritys", ""))
+    if not out["Yritys"]:
+        out["Yritys"] = _company_from_title(title_hint)
     return out
 
 
@@ -757,7 +788,8 @@ def fill_card_details(page, df: pd.DataFrame) -> None:
             continue
         print(f"Haetaan kortti {i + 1}/{n}...", flush=True)
         try:
-            data = fetch_card_details(page, str(link).strip())
+            title_hint = str(df.at[i, "Tehtävänimike"]) if "Tehtävänimike" in df.columns else ""
+            data = fetch_card_details(page, str(link).strip(), title_hint=title_hint)
             val = data.get("Yritys", "")
             if val:
                 df.at[i, "Yritys"] = val
