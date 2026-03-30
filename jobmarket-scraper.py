@@ -380,6 +380,22 @@ def _looks_like_location(value: str) -> bool:
     return False
 
 
+def _company_from_title(title: str) -> str:
+    """Conservative company fallback from title. / Varovainen yritys-fallback otsikosta."""
+    t = (title or "").strip()
+    if not t or "," not in t:
+        return ""
+    cand = t.split(",")[-1].strip()
+    cand = _clean_company_name(cand)
+    if not cand or _looks_like_location(cand):
+        return ""
+    low = cand.lower()
+    company_tokens = (" oy", " oyj", " ab", " ltd", " ky", " tmi", " ry", " inc")
+    if any(tok in low for tok in company_tokens):
+        return cand
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Card loading / Ilmoituskortin lataus
 # ---------------------------------------------------------------------------
@@ -446,6 +462,8 @@ def fetch_card_details(page, url: str, title_hint: str = "") -> dict:
         out["Ammattiryhmä"] = _extract_ammattiryhma(page)
     # Keep only plausible company names.
     out["Yritys"] = _clean_company_name(out.get("Yritys", ""))
+    if not out["Yritys"]:
+        out["Yritys"] = _company_from_title(title_hint)
     return out
 
 
