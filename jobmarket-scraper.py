@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Yhteensopiva käynnistyspiste: toteutus on moduulissa job_collector."""
+"""Compatibility entrypoint for README and tests. / Yhteensopiva käynnistyspiste README:lle ja testeille."""
 from job_collector import main
 
 if __name__ == "__main__":
