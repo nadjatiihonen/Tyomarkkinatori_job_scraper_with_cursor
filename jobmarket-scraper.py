@@ -396,6 +396,57 @@ def _company_from_title(title: str) -> str:
     return ""
 
 
+def _extract_company_from_page(page) -> str:
+    """Extract company directly from vacancy page. / Poimi yritys suoraan työpaikkasivulta."""
+    try:
+        value = page.evaluate(
+            """
+            () => {
+                const clean = (v) => (v || '').toString().trim();
+
+                // 1) JSON-LD (JobPosting.hiringOrganization.name)
+                const ldScripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+                for (const s of ldScripts) {
+                    try {
+                        const raw = clean(s.textContent);
+                        if (!raw) continue;
+                        const data = JSON.parse(raw);
+                        const items = Array.isArray(data) ? data : [data];
+                        for (const item of items) {
+                            const org = item && item.hiringOrganization;
+                            const name = clean(org && org.name);
+                            if (name) return name;
+                        }
+                    } catch (_) {}
+                }
+
+                // 2) Label-based extraction from visible text
+                const bodyText = clean(document.body && document.body.innerText);
+                if (bodyText) {
+                    const m = bodyText.match(/Yritys\\s*[:\\s\\u00a0]+([^\\n]+)/i);
+                    if (m && m[1]) return clean(m[1]);
+                }
+
+                // 3) Common company selectors
+                const selectors = [
+                    '[data-testid*="company"]',
+                    '[class*="company"]',
+                    '[id*="company"]'
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    const t = clean(el && el.textContent);
+                    if (t) return t;
+                }
+                return '';
+            }
+            """
+        )
+        return (value or "").strip()
+    except Exception:
+        return ""
+
+
 # ---------------------------------------------------------------------------
 # Card loading / Ilmoituskortin lataus
 # ---------------------------------------------------------------------------
@@ -460,6 +511,8 @@ def fetch_card_details(page, url: str, title_hint: str = "") -> dict:
 
     if not out.get("Ammattiryhmä"):
         out["Ammattiryhmä"] = _extract_ammattiryhma(page)
+    if not out.get("Yritys"):
+        out["Yritys"] = _extract_company_from_page(page)
     # Keep only plausible company names.
     out["Yritys"] = _clean_company_name(out.get("Yritys", ""))
     if not out["Yritys"]:

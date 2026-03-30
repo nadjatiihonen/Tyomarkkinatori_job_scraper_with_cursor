@@ -29,6 +29,18 @@ def looks_like_location(value: str) -> bool:
     return " " not in s and len(s) <= 14
 
 
+def title_has_company_hint(title: str) -> bool:
+    """True if title likely contains company segment. / Tosi, jos otsikossa on todennäköisesti yritysosa."""
+    t = (title or "").strip()
+    if "," not in t:
+        return False
+    tail = t.split(",")[-1].strip().lower()
+    if not tail:
+        return False
+    company_tokens = (" oy", " oyj", " ab", " ltd", " inc", " ky", " tmi", " ry")
+    return any(tok in f" {tail}" for tok in company_tokens)
+
+
 def main() -> int:
     if not XLSX.exists():
         print(f"ERROR: Excel file not found: {XLSX}")
@@ -51,7 +63,7 @@ def main() -> int:
 
     total = 0
     empty_title = 0
-    filled_company = 0
+    empty_company_required = 0
     location_like_company = 0
 
     for r in range(2, ws.max_row + 1):
@@ -63,10 +75,12 @@ def main() -> int:
         if not str(title).strip():
             empty_title += 1
         c = "" if company is None else str(company).strip()
-        if c:
-            filled_company += 1
-            if looks_like_location(c):
-                location_like_company += 1
+        if not c:
+            if title_has_company_hint(str(title)):
+                empty_company_required += 1
+            continue
+        if looks_like_location(c):
+            location_like_company += 1
 
     wb.close()
 
@@ -76,18 +90,21 @@ def main() -> int:
     if empty_title > 0:
         print(f"ERROR: Found {empty_title} rows with empty Tehtävänimike")
         return 1
-    if filled_company == 0:
-        print("ERROR: Yritys is empty for all rows")
-        return 1
-    if location_like_company > max(5, int(total * 0.1)):
+    if empty_company_required > 0:
         print(
-            f"ERROR: Too many location-like values in Yritys: {location_like_company}/{total}"
+            "ERROR: Yritys is empty in rows that likely contain company in title: "
+            f"{empty_company_required}/{total}"
+        )
+        return 1
+    if location_like_company > 0:
+        print(
+            f"ERROR: Yritys contains location-like values: {location_like_company}/{total}"
         )
         return 1
 
     print(
         "OK: data quality passed "
-        f"(rows={total}, company_filled={filled_company}, location_like={location_like_company})"
+        f"(rows={total}, empty_required={empty_company_required}, location_like={location_like_company})"
     )
     return 0
 
