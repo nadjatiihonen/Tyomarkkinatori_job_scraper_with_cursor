@@ -5,10 +5,10 @@ Collect jobs from tyomarkkinatori.fi into Excel: listing, sync, missing Yritys.
 
 Flow: (1) listing pages → Linkki, Tehtävänimike, Yritys from card
       (2) Excel sync + save
-      (3) open job pages only for rows with missing or bad Yritys
+      (3) open job pages only for rows with missing or bad Yritys (JSON-LD / label only)
 / Rakenne: (1) listasivut → Linkki, Tehtävänimike, Yritys kortilta
            (2) Excel-synk + tallennus
-           (3) avaa ilmoitukset vain riveille, joilla Yritys puuttuu / on huono
+           (3) avaa ilmoitus vain puuttuvaa Yritys varten (ei täyttä korttiparsintaa)
 """
 from __future__ import annotations
 
@@ -40,7 +40,6 @@ LISTING_URL = (
 PAGE_GOTO_TIMEOUT_MS = 45_000
 LISTING_SELECTOR_TIMEOUT_MS = 20_000
 CARD_PAGE_WAIT_MS = 1_500
-SKILLS_SECTION_CLICK_WAIT_MS = 800
 
 # Save Excel after each successful Yritys update (crash safety).
 # / Tallenna Excel jokaisen onnistuneen Yritys-päivityksen jälkeen (turva sammumista vastaan).
@@ -48,42 +47,11 @@ SAVE_AFTER_EVERY_DETAIL_WRITE = True
 
 PAGE_SIZE = 30
 
-# Column names on job detail pages / Ilmoituksen kenttien nimet (Excel-sarakkeet)
-CARD_COLUMNS = [
-    "Yritys",
-    "Sijainti",
-    "Työaika",
-    "Palkan peruste",
-    "Työn jatkuvuus",
-    "Työskentelyaika",
-    "Julkaistu",
-    "Hakuaika päättyy",
-    "Ammatit",
-    "Ammattiryhmä",
-    "Vaadittu koulutustaso",
-    "Ajokortit",
-]
+# DataFrame + Excel columns we use (no full job-card field dump).
+# / Käytetyt sarakkeet (ei koko ilmoituksen kenttälistaa).
+DATA_COLUMNS = ["Linkki", "Tehtävänimike", "Yritys"]
 
-# Skills section parse boundaries / Osaamiset-osion rajat
-OSAAMISET_BOUNDARIES = (
-    "Ammatit",
-    "Osaamiset",
-    "Vaadittu kielitaito",
-    "Vaadittu koulutustaso",
-    "Työssä vaadittavat ajokortit",
-)
-OSAAMISET_SUBSECTIONS = [
-    "Ammatit",
-    "Vaadittu koulutustaso",
-    "Työssä vaadittavat ajokortit",
-]
-OSAAMISET_TO_COLUMN = {
-    "Ammatit": "Ammatit",
-    "Vaadittu koulutustaso": "Vaadittu koulutustaso",
-    "Työssä vaadittavat ajokortit": "Ajokortit",
-}
-
-# Href filters / Linkkisuodattimet
+# Listing page: distinguish job links from list URL / Listasivu: työlinkki vs. lista-URL
 RE_LISTING_PAGE = re.compile(
     r"^https?://[^/]+/henkiloasiakkaat/avoimet-tyopaikat/\?", re.I
 )
@@ -322,205 +290,8 @@ def fetch_all_listings(page: Page) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Job detail text / Ilmoituksen teksti (detail)
+# Job page: Yritys only (no full card parse) / Ilmoitussivu: vain Yritys
 # ---------------------------------------------------------------------------
-
-
-def extract_value_block(
-    text: str,
-    label: str,
-    stop_headers: list[str],
-    max_len: int = 600,
-    section: Optional[str] = None,
-) -> str:
-    """Value after label until a stop header. / Arvo otsakkeen jälkeen kunnes tulee stop-otsikko."""
-    search = (section or text) or ""
-    lines = search.split("\n")
-    for i, line in enumerate(lines):
-        ls = line.strip()
-        if not (
-            ls == label
-            or (
-                ls.startswith(label)
-                and (
-                    len(ls) == len(label)
-                    or ls[len(label) :].strip().startswith(":")
-                )
-            )
-        ):
-            continue
-        vals: list[str] = []
-        for j in range(i + 1, len(lines)):
-            r = lines[j].strip()
-            if not r:
-                continue
-            if any(h in r or r.startswith(h.strip()) for h in stop_headers):
-                break
-            vals.append(r)
-        if vals:
-            return " ".join(vals).strip()[:max_len]
-        return ""
-    return ""
-
-
-def extract_next_line(text: str, label: str, max_len: int = 500) -> str:
-    """First line after label (regex). / Yksi rivi otsakkeen jälkeen (regex)."""
-    m = re.search(re.escape(label) + r"\s*\n\s*([^\n]+)", text)
-    return m.group(1).strip()[:max_len] if m else ""
-
-
-def text_before_location_section(text: str) -> str:
-    """Text before 'Työpaikan sijainti' (better Yritys match). / Teksti ennen sijainti-osiota vähentää väärän Yritys-rivin osumia."""
-    low = text.lower()
-    idx = low.find("työpaikan sijainti")
-    if idx < 0:
-        return text
-    return text[:idx]
-
-
-def parse_osaamiset_section(text: str) -> dict:
-    """Parse 'Tehtävään liittyvät taidot ja osaamiset' block. / Jäsennä osio taidot ja osaamiset."""
-    out = {col: "" for col in OSAAMISET_TO_COLUMN.values()}
-    if not text:
-        return out
-    idx = text.find("Tehtävään liittyvät taidot ja osaamiset")
-    if idx < 0:
-        return out
-    end = text.find("Työpaikan sijainti", idx)
-    if end < 0:
-        end = text.find("Muut tiedot", idx)
-    if end < 0:
-        end = len(text)
-    block = text[idx:end]
-    lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
-
-    for header in OSAAMISET_SUBSECTIONS:
-        col = OSAAMISET_TO_COLUMN.get(header)
-        if not col:
-            continue
-        for j, line in enumerate(lines):
-            if line != header:
-                continue
-            vals: list[str] = []
-            for k in range(j + 1, len(lines)):
-                nxt = lines[k]
-                if nxt in OSAAMISET_BOUNDARIES or nxt in (
-                    "Työpaikan sijainti",
-                    "Muut tiedot",
-                    "Tarkemmat tiedot",
-                ):
-                    break
-                vals.append(nxt)
-            if vals:
-                out[col] = " ".join(vals).strip()[:600]
-            break
-    return out
-
-
-def parse_detail_main_text(text: str) -> dict:
-    """Card columns from main element innerText. / Kentät main-elementin innerTextistä."""
-    out = {k: "" for k in CARD_COLUMNS}
-    if not text:
-        return out
-
-    head = text_before_location_section(text)
-    m = re.search(r"Yritys\s*[:\s\xa0]+\s*([^\n]+)", head, re.I)
-    if m:
-        out["Yritys"] = m.group(1).strip()[:500]
-
-    m = re.search(r"Työpaikan\s+sijainti\s*\n\s*([^\n]+)", text, re.I)
-    if m:
-        first = m.group(1).strip()
-        if first.lower() in ("sijainti", "sijainti :", "sijainti:") or (
-            first.lower().startswith("sijainti") and len(first) < 20
-        ):
-            m2 = re.search(
-                r"Työpaikan\s+sijainti\s*\n\s*[^\n]+\s*\n\s*[:\s\xa0]*\s*([^\n]+)",
-                text,
-                re.I,
-            )
-            if m2:
-                out["Sijainti"] = m2.group(1).strip()[:500]
-        else:
-            out["Sijainti"] = first[:500]
-
-    if not out["Sijainti"]:
-        m = re.search(r"Sijainti\s*[:\s\xa0]+\s*([^\n]+)", text)
-        if m:
-            sij = m.group(1).strip()
-            for stop in (
-                "Kokoaikatyö",
-                "Osa-aikatyö",
-                "Pääsääntöisesti",
-                "Työaika",
-                "Työn jatkuvuus",
-                "Työskentelyaika",
-                "Tarkemmat",
-                "klo ",
-            ):
-                if stop in sij:
-                    sij = sij.split(stop)[0].strip().rstrip(",")
-                    break
-            out["Sijainti"] = sij[:500]
-
-    tarkemmat = (
-        text[text.find("Tarkemmat tiedot") :]
-        if "Tarkemmat tiedot" in text
-        else text
-    )
-    out["Työaika"] = (
-        extract_value_block(
-            text, "Työaika", ["Työn jatkuvuus", "Työ alkaa"], 500, tarkemmat
-        )
-        or extract_value_block(text, "Työaika", ["Työn jatkuvuus", "Työ alkaa"])
-        or extract_next_line(text, "Työaika")
-    )
-    out["Palkan peruste"] = (
-        extract_value_block(
-            text,
-            "Palkan peruste",
-            ["Työskentelyaika", "Työ alkaa", "Avointen", "Lisätietoja"],
-        )
-        or extract_next_line(text, "Palkan peruste")
-    )
-    out["Työn jatkuvuus"] = (
-        extract_value_block(
-            text, "Työn jatkuvuus", ["Työ alkaa", "Palkan peruste", "Lisätietoja"]
-        )
-        or extract_next_line(text, "Työn jatkuvuus")
-    )
-    out["Työskentelyaika"] = extract_next_line(text, "Työskentelyaika")
-
-    m = re.search(r"Julkaistu\s+([0-9]{1,2}\.[0-9]{1,2}\.[0-9]{4})", text)
-    if m:
-        out["Julkaistu"] = m.group(1).strip()
-    m = re.search(
-        r"Hakuaika\s+päättyy\s*[:\s\xa0]+\s*([0-9]{1,2}\.[0-9]{1,2}\.[0-9]{4})",
-        text,
-    )
-    if m:
-        out["Hakuaika päättyy"] = m.group(1).strip()
-
-    for col, val in parse_osaamiset_section(text).items():
-        if val and col in out:
-            out[col] = val
-
-    m = re.search(r"Ammatti(?:nimike)?\s*[:\s\xa0]+\s*([^\n]+)", text, re.I)
-    if m:
-        out["Ammatit"] = m.group(1).strip()[:500]
-    if not out["Ammatit"]:
-        out["Ammatit"] = extract_next_line(text, "Ammatti")
-
-    m = re.search(
-        r"Ammattiryhmä\s*[:\s\xa0]+\s*([^\n]+(?:>\s*[^\n]+)*)",
-        text,
-        re.I,
-    )
-    if m:
-        path = " > ".join(s.strip() for s in m.group(1).split(">"))
-        out["Ammattiryhmä"] = path[:500]
-
-    return out
 
 
 def clean_company_name(value: str) -> str:
@@ -555,7 +326,7 @@ def looks_like_location(value: str) -> bool:
 
 
 def company_from_title_fallback(title: str) -> str:
-    """Last title segment after comma only if legal suffix (Oy, …). / Viimeinen oljenkorsi: viimeinen pilkkuerotettu vain jos Oy-tms."""
+    """Last title segment after comma only if legal suffix (Oy, …). / Viimeinen pilkkuerotettu vain jos Oy-tms."""
     t = (title or "").strip()
     if not t or "," not in t:
         return ""
@@ -570,7 +341,7 @@ def company_from_title_fallback(title: str) -> str:
 
 
 def extract_company_json_ld_and_label(page: Page) -> str:
-    """Fast path: JSON-LD hiringOrganization, then Yritys label (no generic CSS). / Nopein polku: JSON-LD, sitten Yritys-teksti (ei geneerisiä CSS-selektoreita)."""
+    """JSON-LD hiringOrganization, then Yritys label before location block. / JSON-LD, sitten Yritys-teksti ennen sijaintia."""
     try:
         return (
             page.evaluate(
@@ -613,89 +384,22 @@ def extract_company_json_ld_and_label(page: Page) -> str:
         return ""
 
 
-def extract_ammattiryhma_from_page(page: Page) -> str:
-    """Ammattiryhmä path from page body text. / Ammattiryhmä-polku sivun tekstistä."""
-    try:
-        path = page.evaluate(
-            """
-            () => {
-                const text = document.body ? document.body.innerText : '';
-                const markers = ['Ammattiryhmä', 'Ammattiala', 'Ammattiluokitus'];
-                for (const m of markers) {
-                    const idx = text.indexOf(m);
-                    if (idx >= 0) {
-                        const rest = text.substring(idx + m.length)
-                            .replace(/^[:\\s\\xa0]+/, '');
-                        const line = rest.split('\\n')[0].trim();
-                        if (line.indexOf(' > ') >= 0) {
-                            return line.replace(/\\s+/g, ' ').substring(0, 500);
-                        }
-                        const match = rest.match(/^([^\\n]+?)(?=\\n[A-ZÄÖÅ]|$)/);
-                        if (match) return match[1].trim().substring(0, 500);
-                    }
-                }
-                const lines = text.split('\\n');
-                for (const line of lines) {
-                    const t = line.trim();
-                    if (t.split(' > ').length >= 3
-                        && /^[A-Za-zäöåÄÖÅ0-9\\-\\s]+$/.test(t)) {
-                        return t.substring(0, 500);
-                    }
-                }
-                return '';
-            }
-        """
-        )
-        return (path or "").strip()
-    except Exception:
-        return ""
-
-
-def resolve_yritys_field(parsed: dict, page: Page, title_hint: str) -> None:
-    """Fill parsed['Yritys']: detail text, then JSON-LD/label, then title. / Täyttää järjestyksellä: detail → JSON-LD/label → otsikko."""
-    y = clean_company_name(parsed.get("Yritys", "") or "")
-    if looks_like_location(y):
-        y = ""
-    if not y:
-        y = clean_company_name(extract_company_json_ld_and_label(page))
-    if looks_like_location(y):
-        y = ""
-    if not y:
-        y = company_from_title_fallback(title_hint)
-    parsed["Yritys"] = y
-
-
-def fetch_card_details(page: Page, url: str, title_hint: str = "") -> dict:
-    """Open job URL and parse CARD_COLUMNS. / Avaa ilmoitus ja jäsennä kortin kentät."""
-    out = {k: "" for k in CARD_COLUMNS}
+def fetch_yritys_from_job_page(page: Page, url: str, title_hint: str = "") -> str:
+    """Open job URL; Yritys from JSON-LD / page label, else title suffix. / Avaa sivu; Yritys ilman täyttä korttiparsintaa."""
     s = (url or "").strip()
     full = s if s.startswith("http") else f"{BASE_DOMAIN.rstrip('/')}/{s.lstrip('/')}"
     try:
         page.goto(full, wait_until="load", timeout=PAGE_GOTO_TIMEOUT_MS)
         page.wait_for_timeout(CARD_PAGE_WAIT_MS)
     except Exception:
-        return out
+        return ""
 
-    try:
-        btn = page.locator("text=Tehtävään liittyvät taidot ja osaamiset").first
-        if btn.count() > 0:
-            btn.click()
-            page.wait_for_timeout(SKILLS_SECTION_CLICK_WAIT_MS)
-    except Exception:
-        pass
-
-    try:
-        main_el = page.locator("main").first
-        if main_el.count() > 0:
-            out = parse_detail_main_text(main_el.inner_text())
-    except Exception:
-        pass
-
-    if not out.get("Ammattiryhmä"):
-        out["Ammattiryhmä"] = extract_ammattiryhma_from_page(page)
-
-    resolve_yritys_field(out, page, title_hint)
-    return out
+    y = clean_company_name(extract_company_json_ld_and_label(page))
+    if looks_like_location(y):
+        y = ""
+    if not y:
+        y = company_from_title_fallback(title_hint)
+    return y
 
 
 # ---------------------------------------------------------------------------
@@ -704,8 +408,8 @@ def fetch_card_details(page: Page, url: str, title_hint: str = "") -> dict:
 
 
 def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Add missing Linkki, Tehtävänimike, CARD_COLUMNS. / Lisää puuttuvat sarakkeet."""
-    for col in ["Linkki", "Tehtävänimike"] + CARD_COLUMNS:
+    """Ensure Linkki, Tehtävänimike, Yritys exist. / Varmista nämä sarakkeet."""
+    for col in DATA_COLUMNS:
         if col not in df.columns:
             df[col] = ""
     return df
@@ -1090,8 +794,7 @@ def fill_card_details(page: Page, df: pd.DataFrame) -> None:
                 if "Tehtävänimike" in df.columns
                 else ""
             )
-            data = fetch_card_details(page, str(link).strip(), title_hint=title_hint)
-            val = data.get("Yritys", "")
+            val = fetch_yritys_from_job_page(page, str(link).strip(), title_hint=title_hint)
             if val:
                 df.at[i, "Yritys"] = val
                 if SAVE_AFTER_EVERY_DETAIL_WRITE:
