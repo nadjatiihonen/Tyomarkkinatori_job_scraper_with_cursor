@@ -362,16 +362,22 @@ def _clean_company_name(value: str) -> str:
     return s
 
 
-def _company_from_title(title: str) -> str:
-    """Try deriving company name from listing title. / Yritä päätellä yritys työpaikan otsikosta."""
-    t = (title or "").strip()
-    if not t:
-        return ""
-    parts = [p.strip() for p in t.split(",") if p.strip()]
-    if len(parts) < 2:
-        return ""
-    cand = parts[-1]
-    return _clean_company_name(cand)
+def _looks_like_location(value: str) -> bool:
+    """Detect location-like values in Yritys. / Tunnista sijaintia muistuttavat Yritys-arvot."""
+    s = (value or "").strip()
+    if not s:
+        return False
+    low = s.lower()
+    location_tokens = (
+        "helsinki", "espoo", "vantaa", "tampere", "turku", "hämeenlinna",
+        "koko suomi", "suomi", "tai", "etätyö", "etatyö",
+    )
+    if any(tok in low for tok in location_tokens):
+        return True
+    # Single short token is often a city name in this dataset.
+    if " " not in s and len(s) <= 14:
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -440,8 +446,6 @@ def fetch_card_details(page, url: str, title_hint: str = "") -> dict:
         out["Ammattiryhmä"] = _extract_ammattiryhma(page)
     # Keep only plausible company names.
     out["Yritys"] = _clean_company_name(out.get("Yritys", ""))
-    if not out["Yritys"]:
-        out["Yritys"] = _company_from_title(title_hint)
     return out
 
 
@@ -576,11 +580,13 @@ Guarantee: len(df) == len(jobs_from_web). / Takuu: len(df) == len(jobs_from_web)
 
 def _is_row_complete(df: pd.DataFrame, i: int) -> bool:
     """Row is complete when Yritys is filled. / Rivi on valmis, kun Yritys on täytetty."""
-    return (
+    if not (
         "Yritys" in df.columns
         and df.at[i, "Yritys"] is not None
         and str(df.at[i, "Yritys"]).strip() != ""
-    )
+    ):
+        return False
+    return not _looks_like_location(str(df.at[i, "Yritys"]))
 
 
 def _get_url_from_hyperlink(cell) -> Optional[str]:
@@ -776,6 +782,11 @@ def _apply_hyperlinks_to_ws(ws, df: pd.DataFrame, title_col: int, our_cols: list
 
 def fill_card_details(page, df: pd.DataFrame) -> None:
     """Fill Yritys for rows where it is missing. / Täytä Yritys riveille, joilta se puuttuu."""
+    if "Yritys" in df.columns:
+        for i in range(len(df)):
+            if _looks_like_location(str(df.at[i, "Yritys"])):
+                df.at[i, "Yritys"] = ""
+
     n = len(df)
     saved = 0
     skipped = 0
