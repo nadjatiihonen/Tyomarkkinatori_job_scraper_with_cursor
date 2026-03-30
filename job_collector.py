@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Collect jobs from tyomarkkinatori.fi into Excel: listing, sync, missing Yritys.
-/ Työmarkkinatori.fi → Excel: listaus, synkronointi, puuttuvat Yritys-kentät.
+Collect jobs from tyomarkkinatori.fi into Excel: JSON API listing, sync, missing Yritys.
+/ Työmarkkinatori.fi → Excel: JSON-API-listaus, synkronointi, puuttuvat Yritys-kentät.
 
-Flow: (1) listing pages → Linkki, Tehtävänimike, Yritys from card
+Flow: (1) POST /api/jobpostingfulltext/search/v2/search (same filters as listing URL)
       (2) Excel sync + save
-      (3) open job pages only for rows with missing or bad Yritys (JSON-LD / label only)
-/ Rakenne: (1) listasivut → Linkki, Tehtävänimike, Yritys kortilta
+      (3) Playwright only if Yritys still empty (JSON-LD / label on detail page)
+/ Rakenne: (1) virallinen hakurajapinta
            (2) Excel-synk + tallennus
-           (3) avaa ilmoitus vain puuttuvaa Yritys varten (ei täyttä korttiparsintaa)
+           (3) Playwright vain puuttuvaa Yritys varten
 """
 from __future__ import annotations
 
@@ -16,13 +16,16 @@ import os
 import re
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import parse_qs, urlparse
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 
 import pandas as pd
+import requests
 from openpyxl import load_workbook
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
@@ -31,56 +34,92 @@ from playwright.sync_api import Page, sync_playwright
 # Paths and HTTP / Polku ja verkko
 EXCEL_PATH = Path(__file__).resolve().parent / "tyomarkkinatori_jobs.xlsx"
 BASE_DOMAIN = "https://tyomarkkinatori.fi"
+# Listing template (used only to derive API filters). / Listaus-URL → API-suodattimet
 LISTING_URL = (
     "https://tyomarkkinatori.fi/henkiloasiakkaat/avoimet-tyopaikat"
     "?in=25&or=CLOSING&p={p}&ps=30"
 )
+API_SEARCH_URL = f"{BASE_DOMAIN}/api/jobpostingfulltext/search/v2/search"
+JOB_PATH_PREFIX = "/henkiloasiakkaat/avoimet-tyopaikat"
 
-# Timeouts (ms): avoid hangs; not too long / Aikarajat (ms): ei jäätymistä, ei turhia odotuksia
+# Timeouts / Aikarajat
+REQUEST_TIMEOUT_S = 60
 PAGE_GOTO_TIMEOUT_MS = 45_000
-LISTING_SELECTOR_TIMEOUT_MS = 20_000
 CARD_PAGE_WAIT_MS = 1_500
 
 # Save Excel after each successful Yritys update (crash safety).
-# / Tallenna Excel jokaisen onnistuneen Yritys-päivityksen jälkeen (turva sammumista vastaan).
 SAVE_AFTER_EVERY_DETAIL_WRITE = True
 
-PAGE_SIZE = 30
+# Max listing pages (safety). / Listasivujen yläraja
+MAX_LISTING_PAGES = 600
 
-# DataFrame + Excel columns we use (no full job-card field dump).
-# / Käytetyt sarakkeet (ei koko ilmoituksen kenttälistaa).
+# DataFrame columns / DataFrame-sarakkeet
 DATA_COLUMNS = ["Linkki", "Tehtävänimike", "Yritys"]
 
-# Listing page: distinguish job links from list URL / Listasivu: työlinkki vs. lista-URL
-RE_LISTING_PAGE = re.compile(
-    r"^https?://[^/]+/henkiloasiakkaat/avoimet-tyopaikat/\?", re.I
-)
-RE_JOB_PATH = re.compile(r"/avoimet-tyopaikat/[^/?]+", re.I)
-
-# Company vs location heuristics / Yritys vs. sijainti -heuristiikat
+# Company title suffix fallback / Otsikon Oy-tms.-fallback
 COMPANY_SUFFIXES = (" oy", " oyj", " ab", " ltd", " ky", " tmi", " ry", " inc")
-LOCATION_SUBSTRINGS = (
-    "helsinki",
-    "espoo",
-    "vantaa",
-    "tampere",
-    "turku",
-    "hämeenlinna",
-    "koko suomi",
-    "suomi",
-    "tai",
-    "etätyö",
-    "etatyö",
+
+
+def _ascii_fold(s: str) -> str:
+    """Lowercase ASCII for Finnish city matching. / ASCII-pienet kirjaimet ää→a."""
+    return (
+        unicodedata.normalize("NFKD", (s or "").strip())
+        .encode("ascii", "ignore")
+        .decode()
+        .lower()
+        .strip()
+    )
+
+
+# Major Finnish cities (exact match only, ASCII-folded). No "short word" heuristic.
+# / Suuret kaupungit: vain täsmäosuma; ei "lyhyt sana = kaupunki" -heuristiikkaa.
+_FI_CITY_NAMES = (
+    "Helsinki",
+    "Espoo",
+    "Tampere",
+    "Vantaa",
+    "Turku",
+    "Oulu",
+    "Jyväskylä",
+    "Lahti",
+    "Kuopio",
+    "Pori",
+    "Kouvola",
+    "Joensuu",
+    "Lappeenranta",
+    "Hämeenlinna",
+    "Vaasa",
+    "Seinäjoki",
+    "Rovaniemi",
+    "Mikkeli",
+    "Kotka",
+    "Salo",
+    "Hyvinkää",
+    "Porvoo",
+    "Kajaani",
+    "Rauma",
+    "Lohja",
+    "Järvenpää",
+    "Kirkkonummi",
+    "Kerava",
+    "Tuusula",
+    "Savonlinna",
+    "Riihimäki",
+    "Valkeakoski",
+)
+
+FI_MAJOR_CITIES_ASCII = frozenset(
+    _ascii_fold(c) for c in _FI_CITY_NAMES if _ascii_fold(c)
 )
 
 
 # ---------------------------------------------------------------------------
-# URLs and links / URL ja linkit
+# URLs / URLit
 # ---------------------------------------------------------------------------
 
 
 def canonical_job_url(url: str) -> str:
-    """Stable key: no query string, domain always present. / Yhtenäinen avain: ilman queryä, domain aina täynnä."""
+    """Stable key: no query string, domain always present. / Yhtenäinen avain."""
     s = str(url).strip()
     if not s or s.lower() == "nan":
         return ""
@@ -90,199 +129,130 @@ def canonical_job_url(url: str) -> str:
     return s
 
 
-def is_job_posting_href(href: str) -> bool:
-    """True if href is a single job posting, not the listing page. / Tosi, jos href on yksittäinen työilmoitus, ei listasivu."""
-    if not href or RE_LISTING_PAGE.match(href):
-        return False
-    path = (href or "").split("?", 1)[0].rstrip("/")
-    if re.search(r"/avoimet-tyopaikat/?$", path):
-        return False
-    if RE_JOB_PATH.search(href):
-        return True
-    m = re.search(r"/avoimet-tyopaikat/([^/?]+)", path, re.I)
-    if m:
-        seg = m.group(1)
-        if len(seg) >= 8 and seg.lower() not in ("fi", "sv", "en"):
-            return True
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Listing: cards / Listaus: kortit
-# ---------------------------------------------------------------------------
-
-
-def extract_yritys_from_listing_card(loc: Any, title_hint: str = "") -> str:
-    """Company line 'Name | Julkaistu …' by walking up from the job link. / Rivi 'Yritys | Julkaistu …' — kävellään ylös linkistä."""
-    hint = (title_hint or "").strip()
-    try:
-        raw = loc.evaluate(
-            """(el, titleHint) => {
-                const hint = (titleHint || '').toString().trim();
-                const tryLine = (line) => {
-                    const s = (line || '').trim();
-                    const bar = s.indexOf('|');
-                    if (bar < 0) return '';
-                    if (!/Julkaistu/i.test(s.slice(bar + 1))) return '';
-                    let left = s.slice(0, bar).trim();
-                    if (!left || left.length > 200) return '';
-                    if (hint && left.startsWith(hint)) {
-                        left = left.slice(hint.length).trim();
-                        left = left.replace(/^[,|\\s\\u00a0–-]+/, '').trim();
-                    }
-                    return left;
-                };
-                let n = el;
-                for (let d = 0; d < 14 && n; d++) {
-                    const rawText = n.innerText || '';
-                    const lines = rawText.split(/\\r?\\n/).map(t => t.trim())
-                        .filter(Boolean);
-                    for (const line of lines) {
-                        const got = tryLine(line);
-                        if (got) return got;
-                    }
-                    const oneLine = rawText.replace(/\\s+/g, ' ').trim();
-                    const got = tryLine(oneLine);
-                    if (got) return got;
-                    n = n.parentElement;
-                }
-                return '';
-            }""",
-            hint,
-        )
-    except Exception:
+def job_url_from_api_id(job_id: str) -> str:
+    """Public job page URL from API id. / Ilmoituksen sivun URL."""
+    jid = (job_id or "").strip()
+    if not jid:
         return ""
-    s = (raw or "").strip()
-    return s[:500] if s else ""
+    return canonical_job_url(f"{BASE_DOMAIN}{JOB_PATH_PREFIX}/{jid}")
 
 
-def fetch_listing_page(page: Page, page_index: int, aggressive: bool = False) -> list[dict]:
-    """One listing page: Linkki, Tehtävänimike, Yritys (card row). / Yhden sivun kortit: Linkki, Tehtävänimike, Yritys (listausrivi)."""
-    url = LISTING_URL.format(p=page_index)
-    for attempt in range(2):
-        try:
-            # "load" avoids networkidle hangs / "load" välttää networkidle-jäätymiset
-            page.goto(url, wait_until="load", timeout=PAGE_GOTO_TIMEOUT_MS)
-            break
-        except Exception as e:
-            if attempt == 0:
-                print(f"  Yritetään uudelleen (sivu {page_index + 1})...", flush=True)
-            else:
-                print(f"Virhe sivun latauksessa (sivu {page_index + 1}): {e}", flush=True)
-                return []
-
-    wait_after = 4000 if aggressive else 2500
-    scroll_steps = 25 if aggressive else 15
-    step_wait = 600 if aggressive else 400
-    wait_bottom = 4000 if aggressive else 2500
-    try:
-        page.wait_for_selector(
-            "a[href*='/avoimet-tyopaikat/']",
-            timeout=LISTING_SELECTOR_TIMEOUT_MS,
-        )
-        page.wait_for_timeout(wait_after)
-        for _ in range(2):
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(1500)
-        page.evaluate("window.scrollTo(0, 0)")
-        page.wait_for_timeout(500)
-        for step in range(scroll_steps):
-            page.evaluate(f"window.scrollTo(0, {800 * (step + 1)})")
-            page.wait_for_timeout(step_wait)
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(wait_bottom)
-    except Exception:
-        pass
-
-    results: list[dict] = []
-    seen: set[str] = set()
-    for loc in page.locator("a[href*='/avoimet-tyopaikat/']").all():
-        try:
-            href = loc.get_attribute("href")
-            if not is_job_posting_href(href):
-                continue
-            url_key = canonical_job_url(href or "")
-            if not url_key:
-                continue
-            if url_key in seen:
-                continue
-            seen.add(url_key)
-
-            title = (loc.inner_text() or "").strip()
-            if not title or len(title) > 500:
-                title = (loc.get_attribute("title") or "").strip()
-            title = title or "-"
-
-            yritys = extract_yritys_from_listing_card(loc, title_hint=title)
-            yritys = clean_company_name(yritys)
-            if looks_like_location(yritys):
-                yritys = ""
-
-            results.append(
-                {"Linkki": url_key, "Tehtävänimike": title, "Yritys": yritys}
-            )
-        except Exception:
-            continue
-
-    if not results:
-        n = len(page.locator("a[href*='/avoimet-tyopaikat/']").all())
-        if n:
-            print(f"  (Huom: {n} linkkiä, mikään ei täsmännyt.)", flush=True)
-    return results
+# ---------------------------------------------------------------------------
+# API: search body from LISTING_URL / Hakukysely listaus-URL:sta
+# ---------------------------------------------------------------------------
 
 
-def fetch_all_listings(page: Page) -> list[dict]:
-    """All paginated listing pages in order. / Kaikki sivut peräkkäin."""
+def _search_request_body(page_number: int) -> tuple[dict[str, Any], int]:
+    """
+    Build JSON body like the site widget (short query params → filters).
+    Supported: q, in (iscoNotations), or (sorting), p, ps.
+    / Rakenna sama pyyntö kuin sivusto: q, in, or, p, ps.
+    """
+    filled = LISTING_URL.format(p=page_number)
+    parsed = urlparse(filled)
+    q = parse_qs(parsed.query, keep_blank_values=True)
+    page_size = int((q.get("ps") or ["30"])[0])
+    sorting = (q.get("or") or ["CLOSING"])[0]
+    query_text = (q.get("q") or [""])[0]
+    filters: dict[str, Any] = {}
+    if q.get("in"):
+        filters["iscoNotations"] = q["in"]
+    body: dict[str, Any] = {
+        "query": query_text,
+        "filters": filters,
+        "paging": {"pageNumber": page_number, "pageSize": page_size},
+        "sorting": sorting,
+    }
+    return body, page_size
+
+
+def _employer_name_from_api_item(item: dict[str, Any]) -> str:
+    """employer.ownerName.{fi,sv,en} or employer.name. / Työnantajan nimi API-kentistä."""
+    emp = item.get("employer") or {}
+    on = emp.get("ownerName")
+    if isinstance(on, dict):
+        for lang in ("fi", "sv", "en"):
+            v = (on.get(lang) or "").strip()
+            if v:
+                return v[:500]
+        for v in on.values():
+            v = (str(v) or "").strip()
+            if v:
+                return v[:500]
+    n = (emp.get("name") or "").strip()
+    if n:
+        return n[:500]
+    return ""
+
+
+def _title_from_api_item(item: dict[str, Any]) -> str:
+    t = item.get("title")
+    if isinstance(t, dict):
+        for lang in ("fi", "sv", "en"):
+            v = (t.get(lang) or "").strip()
+            if v:
+                return v[:500]
+        for v in t.values():
+            v = (str(v) or "").strip()
+            if v:
+                return v[:500]
+    return (str(t) if t else "").strip()[:500]
+
+
+def job_row_from_api_item(item: dict[str, Any]) -> dict[str, str]:
+    """One row: Linkki, Tehtävänimike, Yritys from API hit. / Yksi rivi API:sta."""
+    jid = (item.get("id") or "").strip()
+    link = job_url_from_api_id(jid)
+    title = _title_from_api_item(item) or "-"
+    yritys = clean_company_name(_employer_name_from_api_item(item))
+    if looks_like_location(yritys):
+        yritys = ""
+    return {"Linkki": link, "Tehtävänimike": title, "Yritys": yritys}
+
+
+def fetch_all_listings_api(session: Optional[requests.Session] = None) -> list[dict]:
+    """
+    All jobs via search API (fast, structured employer names).
+    / Kaikki ilmoitukset hakurajapinnasta.
+    """
+    sess = session or requests.Session()
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Referer": f"{BASE_DOMAIN}/",
+    }
     all_jobs: list[dict] = []
     page_num = 0
-    same_page_fail = 0
-    max_empty_retries = 4
 
-    while True:
-        print(f"Haetaan sivua {page_num + 1}...", flush=True)
-        use_aggressive = page_num == 7
-        batch = fetch_listing_page(page, page_num, aggressive=use_aggressive)
-        expected = PAGE_SIZE
-
-        if batch and len(batch) < expected:
-            print(
-                f"  Sivu {page_num + 1}: vain {len(batch)} korttia "
-                f"(odotus {expected}), haetaan uudelleen...",
-                flush=True,
+    while page_num < MAX_LISTING_PAGES:
+        body, _ = _search_request_body(page_num)
+        print(f"Haetaan API-sivu {page_num + 1}...", flush=True)
+        try:
+            r = sess.post(
+                API_SEARCH_URL,
+                json=body,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT_S,
             )
-            batch2 = fetch_listing_page(page, page_num, aggressive=True)
-            if len(batch2) > len(batch):
-                batch = batch2
-                print(f"  Uudelleenhaulla {len(batch)} korttia.", flush=True)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            print(f"API-virhe (sivu {page_num + 1}): {e}", flush=True)
+            break
 
-        if not batch:
-            same_page_fail += 1
-            if same_page_fail >= max_empty_retries:
-                print(
-                    f"  Lopetetaan (sivu {page_num + 1} tyhjä {same_page_fail} kertaa).",
-                    flush=True,
-                )
-                break
-            if len(all_jobs) % PAGE_SIZE == 0 and len(all_jobs) >= PAGE_SIZE:
-                max_empty_retries = 6
-            print(
-                f"  Tyhjä sivu, yritetään uudelleen "
-                f"({same_page_fail}/{max_empty_retries})...",
-                flush=True,
-            )
-            page.wait_for_timeout(4000)
-            continue
+        content = data.get("content") or []
+        if not content:
+            break
 
-        same_page_fail = 0
-        max_empty_retries = 4
-        known = {j["Linkki"] for j in all_jobs}
-        for job in batch:
-            if job["Linkki"] not in known:
-                known.add(job["Linkki"])
-                all_jobs.append(job)
+        for item in content:
+            if isinstance(item, dict):
+                all_jobs.append(job_row_from_api_item(item))
 
-        print(f"Löytyi {len(batch)} ilmoitusta (yhteensä {len(all_jobs)}).", flush=True)
-        if len(batch) < PAGE_SIZE:
+        print(
+            f"Löytyi {len(content)} ilmoitusta (yhteensä {len(all_jobs)}).",
+            flush=True,
+        )
+        if len(content) < body["paging"]["pageSize"]:
             break
         page_num += 1
 
@@ -290,12 +260,12 @@ def fetch_all_listings(page: Page) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Job page: Yritys only (no full card parse) / Ilmoitussivu: vain Yritys
+# Job page: Yritys fallback (Playwright) / Ilmoitussivu: varayritys
 # ---------------------------------------------------------------------------
 
 
 def clean_company_name(value: str) -> str:
-    """Return plausible company string or empty. / Palauta kelvollinen yritysnimi tai tyhjä."""
+    """Return plausible company string or empty. / Kelvollinen yritysnimi tai tyhjä."""
     s = (value or "").strip()
     if not s or len(s) > 80:
         return ""
@@ -315,18 +285,39 @@ def clean_company_name(value: str) -> str:
 
 
 def looks_like_location(value: str) -> bool:
-    """True if value looks like a place, not a company. / Tosi, jos arvo näyttää sijainnilta, ei yritykseltä."""
+    """
+    True only for exact major-city match or obvious multi-city location strings.
+    No generic "short single word" rule.
+    / Vain täsmäkaupunki tai selvä monen kaupungin -merkkijono.
+    """
     s = (value or "").strip()
     if not s:
         return False
-    low = s.lower()
-    if any(tok in low for tok in LOCATION_SUBSTRINGS):
+    key = _ascii_fold(s)
+    if key in FI_MAJOR_CITIES_ASCII:
         return True
-    return " " not in s and len(s) <= 14
+    low = s.lower()
+    remote_exact = (
+        "koko suomi",
+        "koko suomessa",
+        "100% etätyö",
+        "100% etatyö",
+        "etätyö",
+        "etatyö",
+    )
+    if low in remote_exact:
+        return True
+    if re.search(r"\s+or\s+|\s+tai\s+", low):
+        parts = [p.strip() for p in re.split(r"\s+or\s+|\s+tai\s+", low) if p.strip()]
+        if len(parts) >= 2 and all(
+            _ascii_fold(p) in FI_MAJOR_CITIES_ASCII for p in parts
+        ):
+            return True
+    return False
 
 
 def company_from_title_fallback(title: str) -> str:
-    """Last title segment after comma only if legal suffix (Oy, …). / Viimeinen pilkkuerotettu vain jos Oy-tms."""
+    """Last comma segment if legal suffix (Oy, …). / Viimeinen pilkkuerotettu vain jos Oy-tms."""
     t = (title or "").strip()
     if not t or "," not in t:
         return ""
@@ -341,7 +332,7 @@ def company_from_title_fallback(title: str) -> str:
 
 
 def extract_company_json_ld_and_label(page: Page) -> str:
-    """JSON-LD hiringOrganization, then Yritys label before location block. / JSON-LD, sitten Yritys-teksti ennen sijaintia."""
+    """JSON-LD hiringOrganization, then Yritys label before location. / JSON-LD + Yritys-teksti."""
     try:
         return (
             page.evaluate(
@@ -385,7 +376,7 @@ def extract_company_json_ld_and_label(page: Page) -> str:
 
 
 def fetch_yritys_from_job_page(page: Page, url: str, title_hint: str = "") -> str:
-    """Open job URL; Yritys from JSON-LD / page label, else title suffix. / Avaa sivu; Yritys ilman täyttä korttiparsintaa."""
+    """Open job page; Yritys from JSON-LD / label, else title suffix. / Avaa sivu, poimi Yritys."""
     s = (url or "").strip()
     full = s if s.startswith("http") else f"{BASE_DOMAIN.rstrip('/')}/{s.lstrip('/')}"
     try:
@@ -403,12 +394,12 @@ def fetch_yritys_from_job_page(page: Page, url: str, title_hint: str = "") -> st
 
 
 # ---------------------------------------------------------------------------
-# Excel read/write / Excel (luku ja tallennus)
+# Excel / Excel
 # ---------------------------------------------------------------------------
 
 
 def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure Linkki, Tehtävänimike, Yritys exist. / Varmista nämä sarakkeet."""
+    """Ensure Linkki, Tehtävänimike, Yritys. / Varmista sarakkeet."""
     for col in DATA_COLUMNS:
         if col not in df.columns:
             df[col] = ""
@@ -416,7 +407,7 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def extract_urls_and_titles_from_excel(path: Path, n_rows: int) -> tuple[list[str], list[str]]:
-    """URLs and display text from Tehtävänimike hyperlinks/HYPERLINK formulas. / URL ja näkyvä teksti hyperlinkistä tai HYPERLINK-kaavasta."""
+    """URLs and titles from Tehtävänimike hyperlinks. / URL ja otsikko linkeistä."""
     urls: list[str] = []
     titles: list[str] = []
     try:
@@ -461,7 +452,7 @@ def extract_urls_and_titles_from_excel(path: Path, n_rows: int) -> tuple[list[st
 def sync_dataframe(
     jobs_from_web: list[dict],
 ) -> tuple[pd.DataFrame, int, int, set[str]]:
-    """DataFrame = only jobs on site; returns (df, added, removed_count, removed_links). / Taulukko = vain sivulla olevat ilmoitukset; palauttaa (df, uusia, poistettuja, poistetut linkit)."""
+    """DataFrame = only jobs on site. / Taulukko = vain sivulla olevat."""
     web_links = {canonical_job_url(j["Linkki"]) for j in jobs_from_web}
     web_links.discard("")
 
@@ -550,7 +541,7 @@ def sync_dataframe(
 
 
 def row_has_valid_yritys(df: pd.DataFrame, i: int) -> bool:
-    """True if Yritys is non-empty and not location-like. / Tosi, jos Yritys on täytetty eikä näytä sijainnilta."""
+    """Non-empty Yritys and not classified as location. / Yritys ok."""
     if "Yritys" not in df.columns:
         return False
     v = df.at[i, "Yritys"]
@@ -560,7 +551,6 @@ def row_has_valid_yritys(df: pd.DataFrame, i: int) -> bool:
 
 
 def get_url_from_hyperlink_cell(cell) -> Optional[str]:
-    """URL from cell hyperlink or HYPERLINK formula. / URL hyperlinkistä tai HYPERLINK-kaavasta."""
     h = getattr(cell, "hyperlink", None)
     if h:
         return getattr(h, "target", None) or getattr(h, "location", None)
@@ -572,7 +562,6 @@ def get_url_from_hyperlink_cell(cell) -> Optional[str]:
 
 
 def find_title_column_index(ws) -> int:
-    """1-based column index of Tehtävänimike header. / Tehtävänimike-sarakkeen indeksi (1-pohjainen)."""
     for c in range(1, ws.max_column + 1):
         if ws.cell(row=1, column=c).value == "Tehtävänimike":
             return c
@@ -580,7 +569,6 @@ def find_title_column_index(ws) -> int:
 
 
 def save_workbook_atomic(wb, path: Path) -> None:
-    """Save to temp file then os.replace (lower corruption risk). / Tallenna tempiin, sitten os.replace (vähentää korruptioriskiä)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(suffix=".xlsx", dir=str(path.parent))
@@ -601,7 +589,6 @@ def save_workbook_atomic(wb, path: Path) -> None:
 
 
 def save_excel(df: pd.DataFrame) -> None:
-    """Update Excel rows, hyperlinks, filter. Call often during run. / Päivitä rivit, hyperlinkit, suodatin. Kutsu usein kesken ajon."""
     df = ensure_columns(df)
     display_cols = ["Tehtävänimike", "Yritys"]
 
@@ -712,7 +699,6 @@ def save_excel(df: pd.DataFrame) -> None:
 
 
 def apply_hyperlinks_new_file(path: Path, urls: list[str]) -> None:
-    """Set Tehtävänimike hyperlinks after creating a new workbook. / Aseta hyperlinkit uuden tiedoston jälkeen."""
     try:
         wb = load_workbook(path)
         ws = wb.active
@@ -733,7 +719,6 @@ def set_hyperlink_cell(
     url: str,
     display: Optional[str] = None,
 ) -> None:
-    """Write HYPERLINK formula to cell. / Kirjoita HYPERLINK-kaava soluun."""
     s = str(url).strip()
     if ".fihenkilo" in s:
         s = s.replace(".fihenkilo", ".fi/henkilo", 1)
@@ -752,7 +737,6 @@ def set_hyperlink_cell(
 
 
 def apply_hyperlinks_to_worksheet(ws, df: pd.DataFrame, title_col: int) -> None:
-    """Refresh hyperlinks from df Linkki + Tehtävänimike. / Päivitä hyperlinkit df:n mukaan."""
     linkki_to_row_data: dict[str, Any] = {}
     for _, r in df.iterrows():
         lk = canonical_job_url(str(r.get("Linkki", "")))
@@ -770,8 +754,8 @@ def apply_hyperlinks_to_worksheet(ws, df: pd.DataFrame, title_col: int) -> None:
                 set_hyperlink_cell(ws, r, title_col, url, display=disp)
 
 
-def fill_card_details(page: Page, df: pd.DataFrame) -> None:
-    """Fetch Yritys from job page only for incomplete rows. / Hae Yritys vain riveille, joilla se puuttuu tai on huono."""
+def fill_missing_yritys_with_browser(page: Page, df: pd.DataFrame) -> None:
+    """Playwright only for rows still missing Yritys. / Selain vain puuttuville."""
     if "Yritys" in df.columns:
         for i in range(len(df)):
             if looks_like_location(str(df.at[i, "Yritys"])):
@@ -787,7 +771,7 @@ def fill_card_details(page: Page, df: pd.DataFrame) -> None:
             skipped += 1
             continue
 
-        print(f"Haetaan kortti {i + 1}/{n}...", flush=True)
+        print(f"Haetaan Yritys sivulta {i + 1}/{n}...", flush=True)
         try:
             title_hint = (
                 str(df.at[i, "Tehtävänimike"])
@@ -800,10 +784,19 @@ def fill_card_details(page: Page, df: pd.DataFrame) -> None:
                 if SAVE_AFTER_EVERY_DETAIL_WRITE:
                     save_excel(df)
         except Exception as e:
-            print(f"Kortti {i + 1}/{n} ohitettu: {e}", flush=True)
+            print(f"Rivi {i + 1}/{n} ohitettu: {e}", flush=True)
 
     if skipped:
-        print(f"Ohitettiin {skipped} valmiiksi täytettyä korttia.", flush=True)
+        print(f"Ohitettiin {skipped} riviä (Yritys jo API:sta / kelvollinen).", flush=True)
+
+
+def needs_browser_for_yritys(df: pd.DataFrame) -> bool:
+    for i in range(len(df)):
+        if not row_has_valid_yritys(df, i):
+            lk = df.at[i, "Linkki"]
+            if pd.notna(lk) and str(lk).strip():
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -812,47 +805,48 @@ def fill_card_details(page: Page, df: pd.DataFrame) -> None:
 
 
 def main() -> None:
-    """Run listing sync, save, then fill missing Yritys. / Listaa, synkkaa, tallenna, täytä puuttuva Yritys."""
     print("Työmarkkinatori -synkronointi alkaa.", flush=True)
     df: Optional[pd.DataFrame] = None
 
     try:
-        # Playwright owns browser lifecycle (close on exit). / Selain suljetaan aina poistuttaessa.
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            try:
-                context = browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; rv:109.0) "
-                        "Gecko/20100101 Firefox/115.0"
-                    ),
-                )
-                try:
-                    page = context.new_page()
-                    jobs = fetch_all_listings(page)
-                    if not jobs:
-                        print("Verkosta ei löytynyt ilmoituksia.", flush=True)
-                        return
+        with requests.Session() as http:
+            jobs = fetch_all_listings_api(http)
+            if not jobs:
+                print("API:sta ei löytynyt ilmoituksia.", flush=True)
+                return
 
-                    print(f"Verkosta yhteensä {len(jobs)} ilmoitusta.", flush=True)
-                    df, added, removed_n, _ = sync_dataframe(jobs)
-                    print(
-                        f"Synkronointi: +{added} uutta, -{removed_n} poistunutta.",
-                        flush=True,
-                    )
-                    save_excel(df)
+            print(f"API:sta yhteensä {len(jobs)} ilmoitusta.", flush=True)
+            df, added, removed_n, _ = sync_dataframe(jobs)
+            print(
+                f"Synkronointi: +{added} uutta, -{removed_n} poistunutta.",
+                flush=True,
+            )
+            save_excel(df)
 
-                    print("Haetaan Yritys-tiedot...", flush=True)
-                    fill_card_details(page, df)
-                    save_excel(df)
-                    print(
-                        "Synkronointi valmis. Tehtävänimike-sarake = hyperlink.",
-                        flush=True,
-                    )
-                finally:
-                    context.close()
-            finally:
-                browser.close()
+            if needs_browser_for_yritys(df):
+                print("Täydennetään puuttuvaa Yritys selaimella...", flush=True)
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True)
+                    try:
+                        context = browser.new_context(
+                            user_agent=(
+                                "Mozilla/5.0 (Windows NT 10.0; rv:109.0) "
+                                "Gecko/20100101 Firefox/115.0"
+                            ),
+                        )
+                        try:
+                            page = context.new_page()
+                            fill_missing_yritys_with_browser(page, df)
+                        finally:
+                            context.close()
+                    finally:
+                        browser.close()
+                save_excel(df)
+
+            print(
+                "Synkronointi valmis. Tehtävänimike-sarake = hyperlink.",
+                flush=True,
+            )
 
     except KeyboardInterrupt:
         print("Keskeytetty.", flush=True)

@@ -1,32 +1,14 @@
+import sys
 from pathlib import Path
 
 from openpyxl import load_workbook
 
-
 ROOT = Path(__file__).resolve().parents[1]
 XLSX = ROOT / "tyomarkkinatori_jobs.xlsx"
 
-
-def looks_like_location(value: str) -> bool:
-    s = (value or "").strip()
-    if not s:
-        return False
-    low = s.lower()
-    tokens = (
-        "helsinki",
-        "espoo",
-        "vantaa",
-        "tampere",
-        "turku",
-        "hämeenlinna",
-        "koko suomi",
-        "suomi",
-        "etätyö",
-        "etatyö",
-    )
-    if any(t in low for t in tokens):
-        return True
-    return " " not in s and len(s) <= 14
+# Same rules as job_collector.looks_like_location / Samat säännöt kuin kerääjässä
+sys.path.insert(0, str(ROOT))
+from job_collector import looks_like_location  # noqa: E402
 
 
 def title_has_company_hint(title: str) -> bool:
