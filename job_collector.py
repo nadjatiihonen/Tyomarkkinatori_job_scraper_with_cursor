@@ -55,13 +55,17 @@ SAVE_AFTER_EVERY_DETAIL_WRITE = True
 MAX_LISTING_PAGES = 600
 
 # DataFrame columns / DataFrame-sarakkeet
-DATA_COLUMNS = ["Linkki", "Tehtävänimike", "Yritys", "Työsuhde"]
+DATA_COLUMNS = ["Linkki", "Tehtävänimike", "Yritys", "Työsuhde", "Työaika"]
 
 # Company title suffix fallback / Otsikon Oy-tms.-fallback
 COMPANY_SUFFIXES = (" oy", " oyj", " ab", " ltd", " ky", " tmi", " ry", " inc")
 DEFAULT_CONTINUITY_LABELS = {
     "01": "toistaiseksi voimassa oleva",
     "02": "määräaikainen",
+}
+DEFAULT_WORKTIME_LABELS = {
+    "01": "kokoaikainen",
+    "02": "osa-aikainen",
 }
 
 
@@ -216,6 +220,18 @@ def _continuity_code_to_tyosuhde(code: str) -> str:
     return ""
 
 
+def _worktime_code_to_tyoaika(code: str) -> str:
+    """Map worktime code to worktime label. / Muunna työaikakoodi työaika-tekstiksi."""
+    c = (code or "").strip()
+    if not c:
+        return ""
+    if c.startswith("01"):
+        return DEFAULT_WORKTIME_LABELS["01"]
+    if c.startswith("02"):
+        return DEFAULT_WORKTIME_LABELS["02"]
+    return ""
+
+
 def fetch_continuity_labels(
     session: requests.Session,
 ) -> dict[str, str]:
@@ -257,6 +273,46 @@ def fetch_continuity_labels(
     return out
 
 
+def fetch_worktime_labels(
+    session: requests.Session,
+) -> dict[str, str]:
+    """
+    Load TYÖAIKA code labels from API.
+    / Hae TYÖAIKA-koodien selitteet API:sta.
+    """
+    url = (
+        f"{BASE_DOMAIN}/api/codes/v1/kopa/TY%C3%96AIKA/koodit"
+        f"?voimassa={date.today().isoformat()}"
+    )
+    out: dict[str, str] = {}
+    try:
+        r = session.get(url, timeout=REQUEST_TIMEOUT_S)
+        r.raise_for_status()
+        payload = r.json()
+    except Exception:
+        return out
+
+    if not isinstance(payload, list):
+        return out
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("tunnus") or "").strip()
+        labels = row.get("selite") or []
+        if not code or not isinstance(labels, list):
+            continue
+        fi = ""
+        for item in labels:
+            if not isinstance(item, dict):
+                continue
+            if (item.get("kielikoodi") or "").strip().lower() == "fi":
+                fi = str(item.get("teksti") or "").strip()
+                break
+        if fi:
+            out[code] = _worktime_code_to_tyoaika(code) or fi.lower()
+    return out
+
+
 def _tyosuhde_from_api_item(
     item: dict[str, Any],
     continuity_labels: dict[str, str],
@@ -275,9 +331,22 @@ def _tyosuhde_from_api_item(
     return ""
 
 
+def _tyoaika_from_api_item(
+    item: dict[str, Any],
+    worktime_labels: dict[str, str],
+) -> str:
+    """Työaika from workTime code. / Työaika workTime-koodista."""
+    code = str(item.get("workTime") or "").strip()
+    if not code:
+        return ""
+    mapped = worktime_labels.get(code) or _worktime_code_to_tyoaika(code)
+    return mapped[:120] if mapped else ""
+
+
 def job_row_from_api_item(
     item: dict[str, Any],
     continuity_labels: dict[str, str],
+    worktime_labels: dict[str, str],
 ) -> dict[str, str]:
     """One row: Linkki, Tehtävänimike, Yritys from API hit. / Yksi rivi API:sta."""
     jid = (item.get("id") or "").strip()
@@ -285,6 +354,7 @@ def job_row_from_api_item(
     title = _title_from_api_item(item) or "-"
     yritys = clean_company_name(_employer_name_from_api_item(item))
     tyosuhde = _tyosuhde_from_api_item(item, continuity_labels)
+    tyoaika = _tyoaika_from_api_item(item, worktime_labels)
     if looks_like_location(yritys):
         yritys = ""
     return {
@@ -292,6 +362,7 @@ def job_row_from_api_item(
         "Tehtävänimike": title,
         "Yritys": yritys,
         "Työsuhde": tyosuhde,
+        "Työaika": tyoaika,
     }
 
 
@@ -309,6 +380,7 @@ def fetch_all_listings_api(session: Optional[requests.Session] = None) -> list[d
     all_jobs: list[dict] = []
     page_num = 0
     continuity_labels = fetch_continuity_labels(sess)
+    worktime_labels = fetch_worktime_labels(sess)
 
     while page_num < MAX_LISTING_PAGES:
         body, _ = _search_request_body(page_num)
@@ -332,7 +404,9 @@ def fetch_all_listings_api(session: Optional[requests.Session] = None) -> list[d
 
         for item in content:
             if isinstance(item, dict):
-                all_jobs.append(job_row_from_api_item(item, continuity_labels))
+                all_jobs.append(
+                    job_row_from_api_item(item, continuity_labels, worktime_labels)
+                )
 
         print(
             f"Löytyi {len(content)} ilmoitusta (yhteensä {len(all_jobs)}).",
@@ -556,6 +630,9 @@ def sync_dataframe(
     df = ensure_columns(df)
     if "Tehtävänimike" in df.columns and df["Tehtävänimike"].dtype != object:
         df["Tehtävänimike"] = df["Tehtävänimike"].astype(object)
+    for col in ("Yritys", "Työsuhde", "Työaika"):
+        if col in df.columns and df[col].dtype != object:
+            df[col] = df[col].astype(object)
 
     urls, titles = extract_urls_and_titles_from_excel(EXCEL_PATH, len(df))
     if len(urls) < len(df):
@@ -603,6 +680,7 @@ def sync_dataframe(
 
     link_to_yritys: dict[str, str] = {}
     link_to_tyosuhde: dict[str, str] = {}
+    link_to_tyoaika: dict[str, str] = {}
     for j in jobs_from_web:
         lk = canonical_job_url(j["Linkki"])
         if not lk:
@@ -616,6 +694,9 @@ def sync_dataframe(
         ts = str(j.get("Työsuhde", "") or "").strip()
         if ts:
             link_to_tyosuhde[lk] = ts
+        ta = str(j.get("Työaika", "") or "").strip()
+        if ta:
+            link_to_tyoaika[lk] = ta
     for i in df.index:
         y = link_to_yritys.get(canonical_job_url(str(df.at[i, "Linkki"])), "")
         if y:
@@ -623,6 +704,9 @@ def sync_dataframe(
         ts = link_to_tyosuhde.get(canonical_job_url(str(df.at[i, "Linkki"])), "")
         if ts:
             df.at[i, "Työsuhde"] = ts
+        ta = link_to_tyoaika.get(canonical_job_url(str(df.at[i, "Linkki"])), "")
+        if ta:
+            df.at[i, "Työaika"] = ta
 
     order = {canonical_job_url(j["Linkki"]): i for i, j in enumerate(jobs_from_web)}
     df["_ord"] = df["Linkki"].astype(str).apply(
@@ -683,7 +767,7 @@ def save_workbook_atomic(wb, path: Path) -> None:
 
 def save_excel(df: pd.DataFrame) -> None:
     df = ensure_columns(df)
-    display_cols = ["Tehtävänimike", "Yritys", "Työsuhde"]
+    display_cols = ["Tehtävänimike", "Yritys", "Työsuhde", "Työaika"]
 
     if not EXCEL_PATH.exists():
         df_out = df.reindex(columns=display_cols, fill_value="")
@@ -787,6 +871,8 @@ def save_excel(df: pd.DataFrame) -> None:
         ws.column_dimensions["B"].width = 80
     if ws.max_column >= 3:
         ws.column_dimensions["C"].width = 36
+    if ws.max_column >= 4:
+        ws.column_dimensions["D"].width = 24
     ws.auto_filter.ref = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
 
     save_workbook_atomic(wb, EXCEL_PATH)
