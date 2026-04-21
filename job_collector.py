@@ -29,7 +29,6 @@ if hasattr(sys.stdout, "reconfigure"):
 import pandas as pd
 import requests
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 from playwright.sync_api import Page, sync_playwright
 
@@ -95,6 +94,24 @@ def _ascii_fold(s: str) -> str:
         .lower()
         .strip()
     )
+
+
+def _slugify(value: str) -> str:
+    s = unicodedata.normalize("NFKD", (value or "").strip()).encode("ascii", "ignore").decode()
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    return s.strip("-")
+
+
+def _training_token_from_url(url: str) -> str:
+    s = str(url or "").strip()
+    if not s:
+        return ""
+    m = re.search(
+        r"/koulutukset-ja-palvelut/kurssi/([0-9a-fA-F-]{36})",
+        s,
+    )
+    return (m.group(1) if m else "").lower()
 
 
 # Major Finnish cities (exact match only, ASCII-folded). No "short word" heuristic.
@@ -554,8 +571,13 @@ def _build_training_where(search_term: str) -> dict[str, Any]:
 
 def _training_row_from_item(item: dict[str, Any]) -> dict[str, str]:
     token = str(item.get("token") or "").strip()
-    link = canonical_job_url(f"{BASE_DOMAIN}{TRAINING_PATH_PREFIX}/{token}") if token else ""
     ohjelma = _value_for_language(item.get("names") or []) or "-"
+    slug = _slugify(ohjelma) or token
+    link = (
+        canonical_job_url(f"{BASE_DOMAIN}{TRAINING_PATH_PREFIX}/{token}/{slug}")
+        if token
+        else ""
+    )
 
     jarjestaja = ""
     for org_entry in ((item.get("serviceOffering") or {}).get("organizations") or []):
@@ -572,14 +594,14 @@ def _training_row_from_item(item: dict[str, Any]) -> dict[str, str]:
             city_names.append(name)
     sijainti = ", ".join(city_names)
 
-    kesto = _value_for_language(item.get("implementationDurationDescription") or [])
-    if not kesto:
-        start = str(item.get("startDate") or "").strip()[:10]
-        end = str(item.get("endDate") or "").strip()[:10]
-        if start and end:
-            kesto = f"{start} - {end}"
-        else:
-            kesto = start or end
+    start = str(item.get("startDate") or "").strip()[:10]
+    end = str(item.get("endDate") or "").strip()[:10]
+    if start and end:
+        kesto = f"{start} - {end}"
+    elif start or end:
+        kesto = start or end
+    else:
+        kesto = _value_for_language(item.get("implementationDurationDescription") or [])
     haku_paattyy = str(item.get("publicationEndDate") or "").strip()[:10]
 
     return {
@@ -807,8 +829,10 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _get_or_create_worksheet(wb, sheet_name: str):
-    if sheet_name in wb.sheetnames:
-        return wb[sheet_name]
+    wanted = (sheet_name or "").strip().lower()
+    for existing in wb.sheetnames:
+        if existing.strip().lower() == wanted:
+            return wb[existing]
     return wb.create_sheet(title=sheet_name)
 
 
@@ -1078,37 +1102,26 @@ def save_excel(df: pd.DataFrame, sheet_name: str) -> None:
             continue
 
         if link in link_to_row:
-            excel_row = link_to_row[link]
-            for col in display_cols:
-                if col == "Tehtävänimike":
-                    continue
-                if col in col_indices and col in row:
-                    val = row[col]
-                    if pd.notna(val) and str(val).strip():
-                        ws.cell(
-                            row=excel_row, column=col_indices[col]
-                        ).value = str(val)[:500]
-        else:
-            new_row = ws.max_row + 1
-            for col in display_cols:
-                if col in col_indices and col in row:
-                    val = row[col] if col != "Tehtävänimike" else row.get(
-                        "Tehtävänimike", "-"
-                    )
-                    if pd.notna(val) and str(val).strip():
-                        ws.cell(row=new_row, column=col_indices[col]).value = str(
-                            val
-                        )[:500]
-            set_hyperlink_cell(
-                ws,
-                new_row,
-                title_col,
-                link,
-                display=str(row.get("Tehtävänimike", "-")),
-            )
-            link_to_row[link] = new_row
+            continue
 
-    apply_hyperlinks_to_worksheet(ws, df, title_col)
+        new_row = ws.max_row + 1
+        for col in display_cols:
+            if col in col_indices and col in row:
+                val = row[col] if col != "Tehtävänimike" else row.get(
+                    "Tehtävänimike", "-"
+                )
+                if pd.notna(val) and str(val).strip():
+                    ws.cell(row=new_row, column=col_indices[col]).value = str(
+                        val
+                    )[:500]
+        set_hyperlink_cell(
+            ws,
+            new_row,
+            title_col,
+            link,
+            display=str(row.get("Tehtävänimike", "-")),
+        )
+        link_to_row[link] = new_row
 
     last_data_row = 1
     for r in range(2, ws.max_row + 1):
@@ -1116,16 +1129,6 @@ def save_excel(df: pd.DataFrame, sheet_name: str) -> None:
             last_data_row = r
     while ws.max_row > last_data_row:
         ws.delete_rows(ws.max_row, 1)
-
-    if ws.max_column >= 1:
-        ws.column_dimensions["A"].width = 60
-    if ws.max_column >= 2:
-        ws.column_dimensions["B"].width = 80
-    if ws.max_column >= 3:
-        ws.column_dimensions["C"].width = 36
-    if ws.max_column >= 4:
-        ws.column_dimensions["D"].width = 24
-    ws.auto_filter.ref = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
 
     save_workbook_atomic(wb, EXCEL_PATH)
     print(f"Tallennettu: {last_data_row - 1} riviä.", flush=True)
@@ -1163,10 +1166,9 @@ def set_hyperlink_cell(
         "-"
         if (raw is None or str(raw).strip().lower() in ("", "nan"))
         else str(raw)
-    ).replace('"', '""')
-    url_esc = s.replace('"', '""')
-    cell.value = f'=HYPERLINK("{url_esc}", "{label}")'
-    cell.font = Font(color="0563C1", underline="single")
+    )
+    cell.value = label
+    cell.hyperlink = s
 
 
 def apply_hyperlinks_to_worksheet(ws, df: pd.DataFrame, title_col: int) -> None:
@@ -1193,36 +1195,149 @@ def save_koulutus_excel(df: pd.DataFrame, sheet_name: str) -> None:
             df[col] = ""
 
     wb = load_workbook(EXCEL_PATH) if EXCEL_PATH.exists() else Workbook()
-    ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.create_sheet(title=sheet_name)
+    ws = _get_or_create_worksheet(wb, sheet_name)
 
-    ws.delete_rows(1, ws.max_row)
-    for i, header in enumerate(KOULUTUS_COLUMNS, start=1):
-        ws.cell(row=1, column=i, value=header)
+    # Remove duplicate tabs with same name but different case/spacing.
+    canonical = (sheet_name or "").strip().lower()
+    ws_title = ws.title
+    dup_titles = [
+        t
+        for t in wb.sheetnames
+        if t != ws_title and t.strip().lower() == canonical
+    ]
+    for title in dup_titles:
+        wb.remove(wb[title])
 
-    for row_idx, (_, row) in enumerate(df.iterrows(), start=2):
-        ws.cell(row=row_idx, column=1, value=str(row.get("Ohjelma", "") or "-")[:500])
-        ws.cell(row=row_idx, column=2, value=str(row.get("Järjestäjä", "") or "")[:300])
-        ws.cell(row=row_idx, column=3, value=str(row.get("Sijainti", "") or "")[:300])
-        ws.cell(row=row_idx, column=4, value=str(row.get("Kesto", "") or "")[:120])
-        ws.cell(row=row_idx, column=5, value=str(row.get("Haku paättyy", "") or "")[:30])
-        link = canonical_job_url(str(row.get("Linkki", "") or ""))
-        if link:
-            set_hyperlink_cell(
-                ws,
-                row_idx,
-                1,
-                link,
-                display=str(row.get("Ohjelma", "") or "-"),
-            )
+    # Remove default empty sheet when it was auto-created.
+    if "Sheet" in wb.sheetnames and len(wb.sheetnames) > 1:
+        default_ws = wb["Sheet"]
+        if default_ws.max_row <= 1 and default_ws.max_column <= 1 and not default_ws["A1"].value:
+            wb.remove(default_ws)
 
-    ws.column_dimensions["A"].width = 80
-    ws.column_dimensions["B"].width = 36
-    ws.column_dimensions["C"].width = 24
-    ws.column_dimensions["D"].width = 20
-    ws.column_dimensions["E"].width = 16
-    ws.auto_filter.ref = f"A1:E{max(ws.max_row, 1)}"
+    if ws.max_row < 1 or not ws.cell(row=1, column=1).value:
+        for i, header in enumerate(KOULUTUS_COLUMNS, start=1):
+            ws.cell(row=1, column=i, value=header)
+
+    wanted_rows: dict[str, dict[str, str]] = {}
+    wanted_order: list[str] = []
+    for _, row in df.iterrows():
+        token = _training_token_from_url(str(row.get("Linkki", "")))
+        if not token or token in wanted_rows:
+            continue
+        wanted_rows[token] = {
+            "Ohjelma": str(row.get("Ohjelma", "") or "-")[:500],
+            "Järjestäjä": str(row.get("Järjestäjä", "") or "")[:300],
+            "Sijainti": str(row.get("Sijainti", "") or "")[:300],
+            "Kesto": str(row.get("Kesto", "") or "")[:120],
+            "Haku paättyy": str(row.get("Haku paättyy", "") or "")[:30],
+            "Linkki": canonical_job_url(str(row.get("Linkki", "") or "")),
+        }
+        wanted_order.append(token)
+
+    existing: dict[str, int] = {}
+    for r in range(2, ws.max_row + 1):
+        cell = ws.cell(row=r, column=1)
+        url = get_url_from_hyperlink_cell(cell) or ""
+        token = _training_token_from_url(url)
+        if token:
+            existing[token] = r
+
+    to_delete = sorted(
+        (row_idx for tok, row_idx in existing.items() if tok not in wanted_rows),
+        reverse=True,
+    )
+    for row_idx in to_delete:
+        ws.delete_rows(row_idx, 1)
+        for tok in list(existing):
+            if existing[tok] > row_idx:
+                existing[tok] -= 1
+            elif existing[tok] == row_idx:
+                del existing[tok]
+
+    for token in wanted_order:
+        if token in existing:
+            continue
+        row = wanted_rows[token]
+        new_row = ws.max_row + 1
+        ws.cell(row=new_row, column=1, value=row["Ohjelma"])
+        ws.cell(row=new_row, column=2, value=row["Järjestäjä"])
+        ws.cell(row=new_row, column=3, value=row["Sijainti"])
+        ws.cell(row=new_row, column=4, value=row["Kesto"])
+        ws.cell(row=new_row, column=5, value=row["Haku paättyy"])
+        if row["Linkki"]:
+            ws.cell(row=new_row, column=1).hyperlink = row["Linkki"]
+        existing[token] = new_row
+
     save_workbook_atomic(wb, EXCEL_PATH)
     print(f"{sheet_name}: tallennettu {max(0, ws.max_row - 1)} riviä.", flush=True)
+
+
+def sync_koulutus_dataframe(
+    rows_from_web: list[dict[str, str]],
+    sheet_name: str,
+) -> tuple[pd.DataFrame, int, int]:
+    web_rows: list[dict[str, str]] = []
+    web_tokens: list[str] = []
+    web_token_set: set[str] = set()
+    for row in rows_from_web:
+        token = _training_token_from_url(str(row.get("Linkki", "")))
+        if not token or token in web_token_set:
+            continue
+        web_token_set.add(token)
+        web_tokens.append(token)
+        web_rows.append(row)
+
+    if not EXCEL_PATH.exists():
+        return pd.DataFrame(web_rows), len(web_rows), 0
+
+    try:
+        df = pd.read_excel(EXCEL_PATH, sheet_name=sheet_name)
+    except Exception:
+        return pd.DataFrame(web_rows), len(web_rows), 0
+
+    for col in ["Linkki"] + KOULUTUS_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[["Linkki"] + KOULUTUS_COLUMNS].copy()
+
+    urls, titles = extract_urls_and_titles_from_excel(EXCEL_PATH, len(df), sheet_name)
+    if len(urls) < len(df):
+        urls.extend([""] * (len(df) - len(urls)))
+    if len(titles) < len(df):
+        titles.extend([""] * (len(df) - len(titles)))
+    df["Linkki"] = urls[: len(df)]
+    for i, title in enumerate(titles[: len(df)]):
+        if title and (not str(df.at[i, "Ohjelma"]).strip() or str(df.at[i, "Ohjelma"]).strip() == "nan"):
+            df.at[i, "Ohjelma"] = title
+
+    df["__token"] = df["Linkki"].astype(str).apply(_training_token_from_url)
+    df = df[df["__token"] != ""].copy()
+    excel_token_set = set(df["__token"].astype(str).tolist())
+    new_tokens = web_token_set - excel_token_set
+    removed_tokens = excel_token_set - web_token_set
+
+    if removed_tokens:
+        df = df[~df["__token"].isin(removed_tokens)].copy()
+
+    new_rows = [
+        r for r in web_rows if _training_token_from_url(str(r.get("Linkki", ""))) in new_tokens
+    ]
+    if new_rows:
+        df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+
+    # Keep existing rows unchanged; only new rows are appended.
+    df["__token"] = df["Linkki"].astype(str).apply(_training_token_from_url)
+
+    order = {token: idx for idx, token in enumerate(web_tokens)}
+    df["_ord"] = df["__token"].astype(str).apply(lambda x: order.get(x, 999999))
+    df = (
+        df.sort_values("_ord")
+        .drop(columns=["_ord"])
+        .drop_duplicates(subset=["__token"], keep="first")
+    )
+    df = df.drop(columns=["__token"])
+    df.reset_index(drop=True, inplace=True)
+    return df, len(new_rows), len(removed_tokens)
 
 
 def fill_missing_yritys_with_browser(
@@ -1344,11 +1459,18 @@ def main() -> None:
 
         koulutus_rows = jobs_by_sheet.get(KOULUTUS_SHEET_NAME, [])
         if koulutus_rows:
+            koulutus_df, added_k, removed_k = sync_koulutus_dataframe(
+                koulutus_rows, KOULUTUS_SHEET_NAME
+            )
             print(
                 f"{KOULUTUS_SHEET_NAME}: API:sta yhteensä {len(koulutus_rows)} ohjelmaa.",
                 flush=True,
             )
-            save_koulutus_excel(pd.DataFrame(koulutus_rows), KOULUTUS_SHEET_NAME)
+            print(
+                f"{KOULUTUS_SHEET_NAME}: synkronointi: +{added_k} uutta, -{removed_k} poistunutta.",
+                flush=True,
+            )
+            save_koulutus_excel(koulutus_df, KOULUTUS_SHEET_NAME)
         else:
             print(f"{KOULUTUS_SHEET_NAME}: API:sta ei löytynyt ohjelmia.", flush=True)
 
