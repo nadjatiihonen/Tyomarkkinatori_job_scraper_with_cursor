@@ -28,7 +28,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import pandas as pd
 import requests
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 from playwright.sync_api import Page, sync_playwright
@@ -45,12 +45,20 @@ KIRJANPITO_LISTING_URL = (
     "https://tyomarkkinatori.fi/henkiloasiakkaat/avoimet-tyopaikat"
     "?q=kirjanpito&or=CLOSING&p={p}&ps=30"
 )
+KOULUTUS_LISTING_URL = (
+    "https://tyomarkkinatori.fi/henkiloasiakkaat/koulutukset-ja-palvelut"
+    "?q=rekry&m=0&y=0&pa=1&eo=3&s=All&rs=All&re"
+)
 API_SEARCH_URL = f"{BASE_DOMAIN}/api/jobpostingfulltext/search/v2/search"
+TRAINING_GRAPHQL_URL = f"{BASE_DOMAIN}/api/employmentservicecatalogue/graphql"
 JOB_PATH_PREFIX = "/henkiloasiakkaat/avoimet-tyopaikat"
+TRAINING_PATH_PREFIX = "/henkiloasiakkaat/koulutukset-ja-palvelut/kurssi"
 SHEET_CONFIGS: list[dict[str, str]] = [
     {"sheet_name": "IT", "listing_url": LISTING_URL},
     {"sheet_name": "Kirjanpito", "listing_url": KIRJANPITO_LISTING_URL},
 ]
+KOULUTUS_SHEET_NAME = "koulutus"
+KOULUTUS_COLUMNS = ["Ohjelma", "Järjestäjä", "Sijainti", "Kesto", "Haku paättyy"]
 
 # Timeouts / Aikarajat
 REQUEST_TIMEOUT_S = 60
@@ -432,6 +440,223 @@ def fetch_all_listings_api(
         page_num += 1
 
     return all_jobs
+
+
+def _value_for_language(items: list[dict[str, Any]], lang: str = "fi") -> str:
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        if (item.get("language") or "").strip().lower() == lang:
+            v = str(item.get("value") or "").strip()
+            if v:
+                return v
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        v = str(item.get("value") or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _build_training_where(search_term: str) -> dict[str, Any]:
+    return {
+        "and": [
+            {
+                "or": [
+                    {"names": {"some": {"value": {"contains": search_term}}}},
+                    {"additionalInformation": {"some": {"value": {"contains": search_term}}}},
+                    {"code": {"eq": search_term}},
+                    {
+                        "serviceOffering": {
+                            "or": [
+                                {
+                                    "organizations": {
+                                        "some": {
+                                            "organization": {
+                                                "names": {
+                                                    "some": {"value": {"contains": search_term}}
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                {
+                                    "service": {
+                                        "or": [
+                                            {"names": {"some": {"value": {"contains": search_term}}}},
+                                            {
+                                                "description": {
+                                                    "some": {"value": {"contains": search_term}}
+                                                }
+                                            },
+                                            {"summary": {"some": {"value": {"contains": search_term}}}},
+                                            {
+                                                "serviceClasses": {
+                                                    "some": {
+                                                        "serviceClass": {
+                                                            "name": {
+                                                                "some": {
+                                                                    "value": {"contains": search_term}
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            {"keywords": {"some": {"value": {"contains": search_term}}}},
+                                        ]
+                                    }
+                                },
+                            ]
+                        }
+                    },
+                ]
+            },
+            {
+                "or": [
+                    {
+                        "serviceOffering": {
+                            "service": {
+                                "category": {
+                                    "code": {
+                                        "in": [
+                                            "PK2",
+                                            "PK2.1",
+                                            "PK2.2",
+                                            "PK2.3",
+                                            "PK2.4",
+                                            "PK7",
+                                            "PK7.1",
+                                            "PK7.2",
+                                            "PK7.3",
+                                            "PK7.4",
+                                            "PK7.4.1",
+                                            "PK7.4.2",
+                                            "PK7.4.3",
+                                            "PK13",
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+            {"serviceOffering": {"service": {"origin": {"nin": ["Ecosystem"]}}}},
+        ],
+        "status": {"eq": "Published"},
+        "serviceOffering": {
+            "service": {"moderationStatus": {"eq": "Active"}, "status": {"eq": "Published"}}
+        },
+    }
+
+
+def _training_row_from_item(item: dict[str, Any]) -> dict[str, str]:
+    token = str(item.get("token") or "").strip()
+    link = canonical_job_url(f"{BASE_DOMAIN}{TRAINING_PATH_PREFIX}/{token}") if token else ""
+    ohjelma = _value_for_language(item.get("names") or []) or "-"
+
+    jarjestaja = ""
+    for org_entry in ((item.get("serviceOffering") or {}).get("organizations") or []):
+        org = (org_entry or {}).get("organization") or {}
+        name = _value_for_language(org.get("names") or [])
+        if name:
+            jarjestaja = name
+            break
+
+    city_names: list[str] = []
+    for municipality in ((item.get("area") or {}).get("municipalities") or []):
+        name = _value_for_language((municipality or {}).get("names") or [])
+        if name and name not in city_names:
+            city_names.append(name)
+    sijainti = ", ".join(city_names)
+
+    kesto = _value_for_language(item.get("implementationDurationDescription") or [])
+    if not kesto:
+        start = str(item.get("startDate") or "").strip()[:10]
+        end = str(item.get("endDate") or "").strip()[:10]
+        if start and end:
+            kesto = f"{start} - {end}"
+        else:
+            kesto = start or end
+    haku_paattyy = str(item.get("publicationEndDate") or "").strip()[:10]
+
+    return {
+        "Linkki": link,
+        "Ohjelma": ohjelma[:500],
+        "Järjestäjä": jarjestaja[:300],
+        "Sijainti": sijainti[:300],
+        "Kesto": kesto[:120],
+        "Haku paättyy": haku_paattyy,
+    }
+
+
+def fetch_koulutus_listings_api(
+    listing_url: str,
+    session: Optional[requests.Session] = None,
+) -> list[dict[str, str]]:
+    parsed = urlparse(listing_url)
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    search_term = (params.get("q") or [""])[0].strip()
+    page_size = 12
+    offset = 0
+    out: list[dict[str, str]] = []
+    sess = session or requests.Session()
+
+    query = """
+query GetPublicServiceImplementationsPaginated($where: ServiceImplementationFilterInput!, $pageSize: Int!, $after: Int, $orderBy: [OrderByInput]) {
+  serviceImplementation {
+    allServiceImplementationsPaginated(skip: $after, take: $pageSize, where: $where, orderBy: $orderBy) {
+      pageInfo { hasNextPage }
+      items {
+        token
+        names { language value }
+        publicationEndDate
+        startDate
+        endDate
+        implementationDurationDescription { language value }
+        area { municipalities { names { language value } } }
+        serviceOffering { organizations { organization { names { language value type } } } }
+      }
+    }
+  }
+}
+""".strip()
+
+    while True:
+        variables = {
+            "where": _build_training_where(search_term),
+            "pageSize": page_size,
+            "after": offset,
+            "orderBy": [
+                {"field": "serviceImplementationName", "language": "fi", "order": "Ascending"}
+            ],
+        }
+        payload = {
+            "query": query,
+            "variables": variables,
+            "operationName": "GetPublicServiceImplementationsPaginated",
+        }
+        r = sess.post(TRAINING_GRAPHQL_URL, json=payload, timeout=REQUEST_TIMEOUT_S)
+        r.raise_for_status()
+        data = r.json()
+        page = (
+            (data.get("data") or {})
+            .get("serviceImplementation", {})
+            .get("allServiceImplementationsPaginated", {})
+        )
+        items = page.get("items") or []
+        if not items:
+            break
+        for item in items:
+            if isinstance(item, dict):
+                out.append(_training_row_from_item(item))
+        if not (page.get("pageInfo") or {}).get("hasNextPage"):
+            break
+        offset += page_size
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -962,6 +1187,44 @@ def apply_hyperlinks_to_worksheet(ws, df: pd.DataFrame, title_col: int) -> None:
                 set_hyperlink_cell(ws, r, title_col, url, display=disp)
 
 
+def save_koulutus_excel(df: pd.DataFrame, sheet_name: str) -> None:
+    for col in ["Linkki"] + KOULUTUS_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    wb = load_workbook(EXCEL_PATH) if EXCEL_PATH.exists() else Workbook()
+    ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.create_sheet(title=sheet_name)
+
+    ws.delete_rows(1, ws.max_row)
+    for i, header in enumerate(KOULUTUS_COLUMNS, start=1):
+        ws.cell(row=1, column=i, value=header)
+
+    for row_idx, (_, row) in enumerate(df.iterrows(), start=2):
+        ws.cell(row=row_idx, column=1, value=str(row.get("Ohjelma", "") or "-")[:500])
+        ws.cell(row=row_idx, column=2, value=str(row.get("Järjestäjä", "") or "")[:300])
+        ws.cell(row=row_idx, column=3, value=str(row.get("Sijainti", "") or "")[:300])
+        ws.cell(row=row_idx, column=4, value=str(row.get("Kesto", "") or "")[:120])
+        ws.cell(row=row_idx, column=5, value=str(row.get("Haku paättyy", "") or "")[:30])
+        link = canonical_job_url(str(row.get("Linkki", "") or ""))
+        if link:
+            set_hyperlink_cell(
+                ws,
+                row_idx,
+                1,
+                link,
+                display=str(row.get("Ohjelma", "") or "-"),
+            )
+
+    ws.column_dimensions["A"].width = 80
+    ws.column_dimensions["B"].width = 36
+    ws.column_dimensions["C"].width = 24
+    ws.column_dimensions["D"].width = 20
+    ws.column_dimensions["E"].width = 16
+    ws.auto_filter.ref = f"A1:E{max(ws.max_row, 1)}"
+    save_workbook_atomic(wb, EXCEL_PATH)
+    print(f"{sheet_name}: tallennettu {max(0, ws.max_row - 1)} riviä.", flush=True)
+
+
 def fill_missing_yritys_with_browser(
     page: Page,
     df: pd.DataFrame,
@@ -1026,10 +1289,16 @@ def main() -> None:
             jobs = fetch_all_listings_api(cfg["listing_url"], http)
         return sheet_name, jobs
 
+    def _fetch_koulutus_for_sheet() -> tuple[str, list[dict[str, str]]]:
+        with requests.Session() as http:
+            rows = fetch_koulutus_listings_api(KOULUTUS_LISTING_URL, http)
+        return KOULUTUS_SHEET_NAME, rows
+
     try:
         jobs_by_sheet: dict[str, list[dict]] = {}
-        with ThreadPoolExecutor(max_workers=len(SHEET_CONFIGS)) as executor:
+        with ThreadPoolExecutor(max_workers=len(SHEET_CONFIGS) + 1) as executor:
             futures = [executor.submit(_fetch_jobs_for_sheet, cfg) for cfg in SHEET_CONFIGS]
+            futures.append(executor.submit(_fetch_koulutus_for_sheet))
             for future in as_completed(futures):
                 sheet_name, jobs = future.result()
                 jobs_by_sheet[sheet_name] = jobs
@@ -1072,6 +1341,16 @@ def main() -> None:
                     finally:
                         browser.close()
                 save_excel(df, sheet_name)
+
+        koulutus_rows = jobs_by_sheet.get(KOULUTUS_SHEET_NAME, [])
+        if koulutus_rows:
+            print(
+                f"{KOULUTUS_SHEET_NAME}: API:sta yhteensä {len(koulutus_rows)} ohjelmaa.",
+                flush=True,
+            )
+            save_koulutus_excel(pd.DataFrame(koulutus_rows), KOULUTUS_SHEET_NAME)
+        else:
+            print(f"{KOULUTUS_SHEET_NAME}: API:sta ei löytynyt ohjelmia.", flush=True)
 
         print(
             "Synkronointi valmis. Tehtävänimike-sarake = hyperlink.",
