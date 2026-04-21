@@ -21,6 +21,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
@@ -40,8 +41,16 @@ LISTING_URL = (
     "https://tyomarkkinatori.fi/henkiloasiakkaat/avoimet-tyopaikat"
     "?in=25&or=CLOSING&p={p}&ps=30"
 )
+KIRJANPITO_LISTING_URL = (
+    "https://tyomarkkinatori.fi/henkiloasiakkaat/avoimet-tyopaikat"
+    "?q=kirjanpito&or=CLOSING&p={p}&ps=30"
+)
 API_SEARCH_URL = f"{BASE_DOMAIN}/api/jobpostingfulltext/search/v2/search"
 JOB_PATH_PREFIX = "/henkiloasiakkaat/avoimet-tyopaikat"
+SHEET_CONFIGS: list[dict[str, str]] = [
+    {"sheet_name": "IT", "listing_url": LISTING_URL},
+    {"sheet_name": "Kirjanpito", "listing_url": KIRJANPITO_LISTING_URL},
+]
 
 # Timeouts / Aikarajat
 REQUEST_TIMEOUT_S = 60
@@ -151,13 +160,16 @@ def job_url_from_api_id(job_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _search_request_body(page_number: int) -> tuple[dict[str, Any], int]:
+def _search_request_body(
+    page_number: int,
+    listing_url_template: str,
+) -> tuple[dict[str, Any], int]:
     """
     Build JSON body like the site widget (short query params → filters).
     Supported: q, in (iscoNotations), or (sorting), p, ps.
     / Rakenna sama pyyntö kuin sivusto: q, in, or, p, ps.
     """
-    filled = LISTING_URL.format(p=page_number)
+    filled = listing_url_template.format(p=page_number)
     parsed = urlparse(filled)
     q = parse_qs(parsed.query, keep_blank_values=True)
     page_size = int((q.get("ps") or ["30"])[0])
@@ -366,7 +378,10 @@ def job_row_from_api_item(
     }
 
 
-def fetch_all_listings_api(session: Optional[requests.Session] = None) -> list[dict]:
+def fetch_all_listings_api(
+    listing_url_template: str,
+    session: Optional[requests.Session] = None,
+) -> list[dict]:
     """
     All jobs via search API (fast, structured employer names).
     / Kaikki ilmoitukset hakurajapinnasta.
@@ -383,7 +398,7 @@ def fetch_all_listings_api(session: Optional[requests.Session] = None) -> list[d
     worktime_labels = fetch_worktime_labels(sess)
 
     while page_num < MAX_LISTING_PAGES:
-        body, _ = _search_request_body(page_num)
+        body, _ = _search_request_body(page_num, listing_url_template)
         print(f"Haetaan API-sivu {page_num + 1}...", flush=True)
         try:
             r = sess.post(
@@ -566,13 +581,23 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def extract_urls_and_titles_from_excel(path: Path, n_rows: int) -> tuple[list[str], list[str]]:
+def _get_or_create_worksheet(wb, sheet_name: str):
+    if sheet_name in wb.sheetnames:
+        return wb[sheet_name]
+    return wb.create_sheet(title=sheet_name)
+
+
+def extract_urls_and_titles_from_excel(
+    path: Path,
+    n_rows: int,
+    sheet_name: str,
+) -> tuple[list[str], list[str]]:
     """URLs and titles from Tehtävänimike hyperlinks. / URL ja otsikko linkeistä."""
     urls: list[str] = []
     titles: list[str] = []
     try:
         wb = load_workbook(path, data_only=False)
-        ws = wb.active
+        ws = _get_or_create_worksheet(wb, sheet_name)
         col_idx = 1
         for c in range(1, ws.max_column + 1):
             if ws.cell(row=1, column=c).value == "Tehtävänimike":
@@ -611,6 +636,7 @@ def extract_urls_and_titles_from_excel(path: Path, n_rows: int) -> tuple[list[st
 
 def sync_dataframe(
     jobs_from_web: list[dict],
+    sheet_name: str,
 ) -> tuple[pd.DataFrame, int, int, set[str]]:
     """DataFrame = only jobs on site. / Taulukko = vain sivulla olevat."""
     web_links = {canonical_job_url(j["Linkki"]) for j in jobs_from_web}
@@ -621,7 +647,7 @@ def sync_dataframe(
         return df, len(jobs_from_web), 0, set()
 
     try:
-        df = pd.read_excel(EXCEL_PATH)
+        df = pd.read_excel(EXCEL_PATH, sheet_name=sheet_name)
     except Exception as e:
         print(f"Excelin lukuvirhe: {e}", flush=True)
         df = ensure_columns(pd.DataFrame(jobs_from_web))
@@ -634,7 +660,7 @@ def sync_dataframe(
         if col in df.columns and df[col].dtype != object:
             df[col] = df[col].astype(object)
 
-    urls, titles = extract_urls_and_titles_from_excel(EXCEL_PATH, len(df))
+    urls, titles = extract_urls_and_titles_from_excel(EXCEL_PATH, len(df), sheet_name)
     if len(urls) < len(df):
         urls.extend([""] * (len(df) - len(urls)))
         titles.extend([""] * (len(df) - len(titles)))
@@ -765,19 +791,20 @@ def save_workbook_atomic(wb, path: Path) -> None:
         wb.close()
 
 
-def save_excel(df: pd.DataFrame) -> None:
+def save_excel(df: pd.DataFrame, sheet_name: str) -> None:
     df = ensure_columns(df)
     display_cols = ["Tehtävänimike", "Yritys", "Työsuhde", "Työaika"]
 
     if not EXCEL_PATH.exists():
         df_out = df.reindex(columns=display_cols, fill_value="")
         df_out = df_out[display_cols]
-        df_out.to_excel(EXCEL_PATH, index=False, engine="openpyxl")
-        apply_hyperlinks_new_file(EXCEL_PATH, df["Linkki"].astype(str).tolist())
+        with pd.ExcelWriter(EXCEL_PATH, engine="openpyxl") as writer:
+            df_out.to_excel(writer, index=False, sheet_name=sheet_name)
+        apply_hyperlinks_new_file(EXCEL_PATH, df["Linkki"].astype(str).tolist(), sheet_name)
         return
 
     wb = load_workbook(EXCEL_PATH)
-    ws = wb.active
+    ws = _get_or_create_worksheet(wb, sheet_name)
     title_col = find_title_column_index(ws)
 
     link_to_row: dict[str, int] = {}
@@ -879,10 +906,10 @@ def save_excel(df: pd.DataFrame) -> None:
     print(f"Tallennettu: {last_data_row - 1} riviä.", flush=True)
 
 
-def apply_hyperlinks_new_file(path: Path, urls: list[str]) -> None:
+def apply_hyperlinks_new_file(path: Path, urls: list[str], sheet_name: str) -> None:
     try:
         wb = load_workbook(path)
-        ws = wb.active
+        ws = _get_or_create_worksheet(wb, sheet_name)
         title_col = find_title_column_index(ws)
         for r in range(2, min(ws.max_row + 1, len(urls) + 2)):
             idx = r - 2
@@ -935,7 +962,11 @@ def apply_hyperlinks_to_worksheet(ws, df: pd.DataFrame, title_col: int) -> None:
                 set_hyperlink_cell(ws, r, title_col, url, display=disp)
 
 
-def fill_missing_yritys_with_browser(page: Page, df: pd.DataFrame) -> None:
+def fill_missing_yritys_with_browser(
+    page: Page,
+    df: pd.DataFrame,
+    sheet_name: str,
+) -> None:
     """Playwright only for rows still missing Yritys. / Selain vain puuttuville."""
     if "Yritys" in df.columns:
         for i in range(len(df)):
@@ -963,7 +994,7 @@ def fill_missing_yritys_with_browser(page: Page, df: pd.DataFrame) -> None:
             if val:
                 df.at[i, "Yritys"] = val
                 if SAVE_AFTER_EVERY_DETAIL_WRITE:
-                    save_excel(df)
+                    save_excel(df, sheet_name)
         except Exception as e:
             print(f"Rivi {i + 1}/{n} ohitettu: {e}", flush=True)
 
@@ -987,25 +1018,43 @@ def needs_browser_for_yritys(df: pd.DataFrame) -> bool:
 
 def main() -> None:
     print("Työmarkkinatori -synkronointi alkaa.", flush=True)
-    df: Optional[pd.DataFrame] = None
+    dfs: dict[str, pd.DataFrame] = {}
+
+    def _fetch_jobs_for_sheet(cfg: dict[str, str]) -> tuple[str, list[dict]]:
+        sheet_name = cfg["sheet_name"]
+        with requests.Session() as http:
+            jobs = fetch_all_listings_api(cfg["listing_url"], http)
+        return sheet_name, jobs
 
     try:
-        with requests.Session() as http:
-            jobs = fetch_all_listings_api(http)
-            if not jobs:
-                print("API:sta ei löytynyt ilmoituksia.", flush=True)
-                return
+        jobs_by_sheet: dict[str, list[dict]] = {}
+        with ThreadPoolExecutor(max_workers=len(SHEET_CONFIGS)) as executor:
+            futures = [executor.submit(_fetch_jobs_for_sheet, cfg) for cfg in SHEET_CONFIGS]
+            for future in as_completed(futures):
+                sheet_name, jobs = future.result()
+                jobs_by_sheet[sheet_name] = jobs
 
-            print(f"API:sta yhteensä {len(jobs)} ilmoitusta.", flush=True)
-            df, added, removed_n, _ = sync_dataframe(jobs)
+        for cfg in SHEET_CONFIGS:
+            sheet_name = cfg["sheet_name"]
+            jobs = jobs_by_sheet.get(sheet_name, [])
+            if not jobs:
+                print(f"{sheet_name}: API:sta ei löytynyt ilmoituksia.", flush=True)
+                continue
+
+            print(f"{sheet_name}: API:sta yhteensä {len(jobs)} ilmoitusta.", flush=True)
+            df, added, removed_n, _ = sync_dataframe(jobs, sheet_name)
+            dfs[sheet_name] = df
             print(
-                f"Synkronointi: +{added} uutta, -{removed_n} poistunutta.",
+                f"{sheet_name}: synkronointi: +{added} uutta, -{removed_n} poistunutta.",
                 flush=True,
             )
-            save_excel(df)
+            save_excel(df, sheet_name)
 
             if needs_browser_for_yritys(df):
-                print("Täydennetään puuttuvaa Yritys selaimella...", flush=True)
+                print(
+                    f"{sheet_name}: täydennetään puuttuvaa Yritys selaimella...",
+                    flush=True,
+                )
                 with sync_playwright() as p:
                     browser = p.chromium.launch(headless=True)
                     try:
@@ -1017,28 +1066,28 @@ def main() -> None:
                         )
                         try:
                             page = context.new_page()
-                            fill_missing_yritys_with_browser(page, df)
+                            fill_missing_yritys_with_browser(page, df, sheet_name)
                         finally:
                             context.close()
                     finally:
                         browser.close()
-                save_excel(df)
+                save_excel(df, sheet_name)
 
-            print(
-                "Synkronointi valmis. Tehtävänimike-sarake = hyperlink.",
-                flush=True,
-            )
+        print(
+            "Synkronointi valmis. Tehtävänimike-sarake = hyperlink.",
+            flush=True,
+        )
 
     except KeyboardInterrupt:
         print("Keskeytetty.", flush=True)
-        if df is not None:
-            save_excel(df)
+        for sheet_name, df in dfs.items():
+            save_excel(df, sheet_name)
         sys.exit(1)
     except Exception as e:
         print(f"Virhe: {e}", flush=True)
-        if df is not None:
+        for sheet_name, df in dfs.items():
             try:
-                save_excel(df)
+                save_excel(df, sheet_name)
             except Exception:
                 pass
         raise
