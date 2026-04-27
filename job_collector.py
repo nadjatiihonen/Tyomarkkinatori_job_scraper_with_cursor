@@ -57,7 +57,7 @@ SHEET_CONFIGS: list[dict[str, str]] = [
     {"sheet_name": "Kirjanpito", "listing_url": KIRJANPITO_LISTING_URL},
 ]
 KOULUTUS_SHEET_NAME = "koulutus"
-KOULUTUS_COLUMNS = ["Ohjelma", "Järjestäjä", "Sijainti", "Kesto", "Haku paättyy"]
+KOULUTUS_COLUMNS = ["Ohjelma", "Järjestäjä", "Sijainti", "Kesto", "Haku paättyy", "Julkaistu"]
 
 # Timeouts / Aikarajat
 REQUEST_TIMEOUT_S = 60
@@ -71,7 +71,7 @@ SAVE_AFTER_EVERY_DETAIL_WRITE = True
 MAX_LISTING_PAGES = 600
 
 # DataFrame columns / DataFrame-sarakkeet
-DATA_COLUMNS = ["Linkki", "Tehtävänimike", "Yritys", "Työsuhde", "Työaika"]
+DATA_COLUMNS = ["Linkki", "Tehtävänimike", "Yritys", "Työsuhde", "Työaika", "Julkaistu"]
 
 # Company title suffix fallback / Otsikon Oy-tms.-fallback
 COMPANY_SUFFIXES = (" oy", " oyj", " ab", " ltd", " ky", " tmi", " ry", " inc")
@@ -269,6 +269,13 @@ def _worktime_code_to_tyoaika(code: str) -> str:
     return ""
 
 
+def _iso_date_ymd(value: Any) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    return s[:10]
+
+
 def fetch_continuity_labels(
     session: requests.Session,
 ) -> dict[str, str]:
@@ -392,6 +399,7 @@ def job_row_from_api_item(
     yritys = clean_company_name(_employer_name_from_api_item(item))
     tyosuhde = _tyosuhde_from_api_item(item, continuity_labels)
     tyoaika = _tyoaika_from_api_item(item, worktime_labels)
+    julkaistu = _iso_date_ymd(item.get("publishDate") or item.get("created"))
     if looks_like_location(yritys):
         yritys = ""
     return {
@@ -400,6 +408,7 @@ def job_row_from_api_item(
         "Yritys": yritys,
         "Työsuhde": tyosuhde,
         "Työaika": tyoaika,
+        "Julkaistu": julkaistu,
     }
 
 
@@ -603,6 +612,7 @@ def _training_row_from_item(item: dict[str, Any]) -> dict[str, str]:
     else:
         kesto = _value_for_language(item.get("implementationDurationDescription") or [])
     haku_paattyy = str(item.get("publicationEndDate") or "").strip()[:10]
+    julkaistu = _iso_date_ymd(item.get("publicationStartDate") or item.get("created"))
 
     return {
         "Linkki": link,
@@ -611,6 +621,7 @@ def _training_row_from_item(item: dict[str, Any]) -> dict[str, str]:
         "Sijainti": sijainti[:300],
         "Kesto": kesto[:120],
         "Haku paättyy": haku_paattyy,
+        "Julkaistu": julkaistu,
     }
 
 
@@ -633,6 +644,7 @@ query GetPublicServiceImplementationsPaginated($where: ServiceImplementationFilt
       pageInfo { hasNextPage }
       items {
         token
+        publicationStartDate
         names { language value }
         publicationEndDate
         startDate
@@ -948,14 +960,17 @@ def sync_dataframe(
         canonical_job_url(j["Linkki"]): j.get("Tehtävänimike", "") for j in jobs_from_web
     }
     for i in df.index:
-        if is_empty_title(df.at[i, "Tehtävänimike"]):
-            t = link_to_title.get(canonical_job_url(str(df.at[i, "Linkki"])), "-")
-            if t and str(t).strip().lower() != "nan":
-                df.at[i, "Tehtävänimike"] = str(t)
+        t = link_to_title.get(canonical_job_url(str(df.at[i, "Linkki"])), "")
+        if t and str(t).strip().lower() != "nan":
+            # Keep title aligned with the current posting behind this URL.
+            df.at[i, "Tehtävänimike"] = str(t)
+        elif is_empty_title(df.at[i, "Tehtävänimike"]):
+            df.at[i, "Tehtävänimike"] = "-"
 
     link_to_yritys: dict[str, str] = {}
     link_to_tyosuhde: dict[str, str] = {}
     link_to_tyoaika: dict[str, str] = {}
+    link_to_julkaistu: dict[str, str] = {}
     for j in jobs_from_web:
         lk = canonical_job_url(j["Linkki"])
         if not lk:
@@ -972,6 +987,9 @@ def sync_dataframe(
         ta = str(j.get("Työaika", "") or "").strip()
         if ta:
             link_to_tyoaika[lk] = ta
+        jul = str(j.get("Julkaistu", "") or "").strip()
+        if jul:
+            link_to_julkaistu[lk] = jul
     for i in df.index:
         y = link_to_yritys.get(canonical_job_url(str(df.at[i, "Linkki"])), "")
         if y:
@@ -982,6 +1000,9 @@ def sync_dataframe(
         ta = link_to_tyoaika.get(canonical_job_url(str(df.at[i, "Linkki"])), "")
         if ta:
             df.at[i, "Työaika"] = ta
+        jul = link_to_julkaistu.get(canonical_job_url(str(df.at[i, "Linkki"])), "")
+        if jul:
+            df.at[i, "Julkaistu"] = jul
 
     order = {canonical_job_url(j["Linkki"]): i for i, j in enumerate(jobs_from_web)}
     df["_ord"] = df["Linkki"].astype(str).apply(
@@ -1042,7 +1063,7 @@ def save_workbook_atomic(wb, path: Path) -> None:
 
 def save_excel(df: pd.DataFrame, sheet_name: str) -> None:
     df = ensure_columns(df)
-    display_cols = ["Tehtävänimike", "Yritys", "Työsuhde", "Työaika"]
+    display_cols = ["Tehtävänimike", "Yritys", "Työsuhde", "Työaika", "Julkaistu"]
 
     if not EXCEL_PATH.exists():
         df_out = df.reindex(columns=display_cols, fill_value="")
@@ -1093,6 +1114,26 @@ def save_excel(df: pd.DataFrame, sheet_name: str) -> None:
             ws.cell(row=1, column=new_c, value=col)
             col_indices[col] = new_c
 
+    def write_display_row(target_row: int, row_data: pd.Series, link_url: str) -> None:
+        for col in display_cols:
+            if col in col_indices and col in row_data:
+                val = (
+                    row_data[col]
+                    if col != "Tehtävänimike"
+                    else row_data.get("Tehtävänimike", "-")
+                )
+                if pd.notna(val) and str(val).strip():
+                    ws.cell(row=target_row, column=col_indices[col]).value = str(val)[:500]
+                else:
+                    ws.cell(row=target_row, column=col_indices[col]).value = None
+        set_hyperlink_cell(
+            ws,
+            target_row,
+            title_col,
+            link_url,
+            display=str(row_data.get("Tehtävänimike", "-")),
+        )
+
     for _, row in df.iterrows():
         link_raw = str(row.get("Linkki", "")).strip()
         if not link_raw or link_raw == "nan":
@@ -1102,25 +1143,11 @@ def save_excel(df: pd.DataFrame, sheet_name: str) -> None:
             continue
 
         if link in link_to_row:
+            write_display_row(link_to_row[link], row, link)
             continue
 
         new_row = ws.max_row + 1
-        for col in display_cols:
-            if col in col_indices and col in row:
-                val = row[col] if col != "Tehtävänimike" else row.get(
-                    "Tehtävänimike", "-"
-                )
-                if pd.notna(val) and str(val).strip():
-                    ws.cell(row=new_row, column=col_indices[col]).value = str(
-                        val
-                    )[:500]
-        set_hyperlink_cell(
-            ws,
-            new_row,
-            title_col,
-            link,
-            display=str(row.get("Tehtävänimike", "-")),
-        )
+        write_display_row(new_row, row, link)
         link_to_row[link] = new_row
 
     last_data_row = 1
@@ -1217,6 +1244,23 @@ def save_koulutus_excel(df: pd.DataFrame, sheet_name: str) -> None:
     if ws.max_row < 1 or not ws.cell(row=1, column=1).value:
         for i, header in enumerate(KOULUTUS_COLUMNS, start=1):
             ws.cell(row=1, column=i, value=header)
+    else:
+        existing_headers: dict[str, int] = {}
+        for c in range(1, ws.max_column + 1):
+            val = ws.cell(row=1, column=c).value
+            if isinstance(val, str) and val.strip():
+                existing_headers[val.strip()] = c
+        for header in KOULUTUS_COLUMNS:
+            if header not in existing_headers:
+                new_c = ws.max_column + 1
+                ws.cell(row=1, column=new_c, value=header)
+                existing_headers[header] = new_c
+
+    koulutus_col_idx: dict[str, int] = {}
+    for c in range(1, ws.max_column + 1):
+        val = ws.cell(row=1, column=c).value
+        if val in KOULUTUS_COLUMNS:
+            koulutus_col_idx[str(val)] = c
 
     wanted_rows: dict[str, dict[str, str]] = {}
     wanted_order: list[str] = []
@@ -1230,6 +1274,7 @@ def save_koulutus_excel(df: pd.DataFrame, sheet_name: str) -> None:
             "Sijainti": str(row.get("Sijainti", "") or "")[:300],
             "Kesto": str(row.get("Kesto", "") or "")[:120],
             "Haku paättyy": str(row.get("Haku paättyy", "") or "")[:30],
+            "Julkaistu": str(row.get("Julkaistu", "") or "")[:30],
             "Linkki": canonical_job_url(str(row.get("Linkki", "") or "")),
         }
         wanted_order.append(token)
@@ -1255,17 +1300,16 @@ def save_koulutus_excel(df: pd.DataFrame, sheet_name: str) -> None:
                 del existing[tok]
 
     for token in wanted_order:
-        if token in existing:
-            continue
         row = wanted_rows[token]
-        new_row = ws.max_row + 1
-        ws.cell(row=new_row, column=1, value=row["Ohjelma"])
-        ws.cell(row=new_row, column=2, value=row["Järjestäjä"])
-        ws.cell(row=new_row, column=3, value=row["Sijainti"])
-        ws.cell(row=new_row, column=4, value=row["Kesto"])
-        ws.cell(row=new_row, column=5, value=row["Haku paättyy"])
+        new_row = existing[token] if token in existing else (ws.max_row + 1)
+        ws.cell(row=new_row, column=koulutus_col_idx["Ohjelma"], value=row["Ohjelma"])
+        ws.cell(row=new_row, column=koulutus_col_idx["Järjestäjä"], value=row["Järjestäjä"])
+        ws.cell(row=new_row, column=koulutus_col_idx["Sijainti"], value=row["Sijainti"])
+        ws.cell(row=new_row, column=koulutus_col_idx["Kesto"], value=row["Kesto"])
+        ws.cell(row=new_row, column=koulutus_col_idx["Haku paättyy"], value=row["Haku paättyy"])
+        ws.cell(row=new_row, column=koulutus_col_idx["Julkaistu"], value=row["Julkaistu"])
         if row["Linkki"]:
-            ws.cell(row=new_row, column=1).hyperlink = row["Linkki"]
+            ws.cell(row=new_row, column=koulutus_col_idx["Ohjelma"]).hyperlink = row["Linkki"]
         existing[token] = new_row
 
     save_workbook_atomic(wb, EXCEL_PATH)
@@ -1325,7 +1369,16 @@ def sync_koulutus_dataframe(
     if new_rows:
         df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
 
-    # Keep existing rows unchanged; only new rows are appended.
+    token_to_published = {
+        _training_token_from_url(str(r.get("Linkki", ""))): str(r.get("Julkaistu", "") or "")
+        for r in web_rows
+    }
+    for i in df.index:
+        tok = str(df.at[i, "__token"])
+        if tok in token_to_published:
+            df.at[i, "Julkaistu"] = token_to_published[tok]
+
+    # Keep existing rows mostly unchanged; only publication date is refreshed.
     df["__token"] = df["Linkki"].astype(str).apply(_training_token_from_url)
 
     order = {token: idx for idx, token in enumerate(web_tokens)}
