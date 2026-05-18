@@ -38,7 +38,7 @@ BASE_DOMAIN = "https://tyomarkkinatori.fi"
 # Listing template (used only to derive API filters). / Listaus-URL → API-suodattimet
 LISTING_URL = (
     "https://tyomarkkinatori.fi/henkiloasiakkaat/avoimet-tyopaikat"
-    "?in=25&or=CLOSING&p={p}&ps=30"
+    "?q=sihteeri&p={p}&ps=30"
 )
 KIRJANPITO_LISTING_URL = (
     "https://tyomarkkinatori.fi/henkiloasiakkaat/avoimet-tyopaikat"

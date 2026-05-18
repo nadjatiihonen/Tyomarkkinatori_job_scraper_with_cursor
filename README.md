@@ -6,7 +6,7 @@ Kerää Työmarkkinatorin dataa ja päivittää olemassa olevan Excel-työkirjan
 ## What the script updates / Mitä skripti päivittää
 
 - `IT` tab from:
-  - `https://tyomarkkinatori.fi/henkiloasiakkaat/avoimet-tyopaikat?in=25&or=CLOSING`
+  - `https://tyomarkkinatori.fi/henkiloasiakkaat/avoimet-tyopaikat?q=sihteeri`
 - `Kirjanpito` tab from:
   - `https://tyomarkkinatori.fi/henkiloasiakkaat/avoimet-tyopaikat?q=kirjanpito&or=CLOSING`
 - `koulutus` tab from:
