@@ -8,17 +8,13 @@ Kerää Työmarkkinatorin avoimet työpaikat ja koulutukset Excel-tiedostoon `ty
 
 | Excel tab | Source listing |
 |-----------|----------------|
-| `IT` | [Avoimet työpaikat — haku: sihteeri](https://tyomarkkinatori.fi/henkiloasiakkaat/avoimet-tyopaikat?q=sihteeri) |
+| `sihteeri` | [Avoimet työpaikat — haku: sihteeri](https://tyomarkkinatori.fi/henkiloasiakkaat/avoimet-tyopaikat?q=sihteeri) |
 | `Kirjanpito` | [Avoimet työpaikat — haku: kirjanpito](https://tyomarkkinatori.fi/henkiloasiakkaat/avoimet-tyopaikat?q=kirjanpito&or=CLOSING) |
 | `koulutus` | [Koulutukset ja palvelut — haku: rekry](https://tyomarkkinatori.fi/henkiloasiakkaat/koulutukset-ja-palvelut?q=rekry&m=0&y=0&pa=1&eo=3&s=All&rs=All&re) |
 
-The `IT` sheet name is kept for compatibility with the existing workbook; the data comes from the **sihteeri** text search, not the former ISCO industry filter (`in=25`).
-
-Välilehden nimi `IT` säilyy vanhan työkirjan vuoksi; data haetaan **sihteeri**-hakusanalla (ei enää ISCO-toimialasuodattimella `in=25`).
-
 ### Columns / Sarakkeet
 
-**`IT` and `Kirjanpito`:**
+**`sihteeri` and `Kirjanpito`:**
 
 - `Tehtävänimike` — job title (hyperlink to the posting)
 - `Yritys` — employer (from API; Playwright fills gaps if needed)

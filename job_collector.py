@@ -53,7 +53,7 @@ TRAINING_GRAPHQL_URL = f"{BASE_DOMAIN}/api/employmentservicecatalogue/graphql"
 JOB_PATH_PREFIX = "/henkiloasiakkaat/avoimet-tyopaikat"
 TRAINING_PATH_PREFIX = "/henkiloasiakkaat/koulutukset-ja-palvelut/kurssi"
 SHEET_CONFIGS: list[dict[str, str]] = [
-    {"sheet_name": "IT", "listing_url": LISTING_URL},
+    {"sheet_name": "sihteeri", "listing_url": LISTING_URL},
     {"sheet_name": "Kirjanpito", "listing_url": KIRJANPITO_LISTING_URL},
 ]
 KOULUTUS_SHEET_NAME = "koulutus"
